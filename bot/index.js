@@ -861,8 +861,8 @@ bot.catch((err) => console.error("[bot-error]", err.message));
 bot.start({
   onStart: () => {
     console.log(`Agent bot started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`);
-    if (OWNER_ID) console.log(`Owner: ${OWNER_ID} (only owner can use bot)`);
-    else console.log("Warning: OWNER_ID not set — bot accepts messages from anyone");
+    if (_ownerId) console.log(`Owner: ${_ownerId} (only owner can use bot)`);
+    else console.log("No owner yet — first /start will auto-lock");
   },
   drop_pending_updates: true,
 });
