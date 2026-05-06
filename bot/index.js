@@ -9,7 +9,7 @@
 import { Bot, Keyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
@@ -19,13 +19,13 @@ import http from "node:http";
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const OWNER_ID = process.env.OWNER_ID || null; // Telegram ID владельца (если задан — бот отвечает только ему)
 const AGENT_HOME = process.env.AGENT_HOME || "/home/agent";
 const WORKSPACE = join(AGENT_HOME, "workspace");
 const PROJECTS = join(AGENT_HOME, "projects");
 const DATA_DIR = join(AGENT_HOME, ".agent");
 const MEDIA_DIR = join(WORKSPACE, ".media");
 const SESSIONS_FILE = join(DATA_DIR, "sessions.json");
+const OWNER_FILE = join(DATA_DIR, "owner.json");
 
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN is required");
@@ -37,11 +37,37 @@ for (const dir of [DATA_DIR, join(WORKSPACE, "memory"), join(WORKSPACE, "knowled
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 
-// ─── OWNER CHECK ────────────────────────────────────────────────────────────
+// ─── OWNER CHECK (auto-lock to first user) ──────────────────────────────────
+
+// Priority: OWNER_ID env var > owner.json file > auto-lock on first /start
+let _ownerId = process.env.OWNER_ID || null;
+
+function loadOwner() {
+  if (_ownerId) return; // env var takes priority
+  try {
+    const data = JSON.parse(readFileSync(OWNER_FILE, "utf8"));
+    _ownerId = String(data.id);
+    console.log(`[owner] loaded from file: ${_ownerId} (${data.name || "unknown"})`);
+  } catch {}
+}
+
+function saveOwner(ctx) {
+  const data = {
+    id: String(ctx.from.id),
+    name: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" "),
+    username: ctx.from.username || null,
+    lockedAt: new Date().toISOString(),
+  };
+  _ownerId = data.id;
+  writeFileSync(OWNER_FILE, JSON.stringify(data, null, 2));
+  console.log(`[owner] auto-locked to: ${data.id} (${data.name})`);
+}
+
+loadOwner();
 
 function isOwner(ctx) {
-  if (!OWNER_ID) return true; // Если OWNER_ID не задан — бот открыт для всех
-  return String(ctx.from?.id) === String(OWNER_ID);
+  if (!_ownerId) return false; // No owner yet — only /start can set it
+  return String(ctx.from?.id) === String(_ownerId);
 }
 
 // ─── PERSISTENT KEYBOARD ────────────────────────────────────────────────────
@@ -206,9 +232,14 @@ async function downloadAndSave(ctx, fileId, ext) {
   const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
   await downloadTgFile(fileUrl, tmpPath);
 
-  // Move to persistent .media/ directory
+  // Move to persistent .media/ directory (copyFile+unlink for cross-filesystem safety)
   const destPath = join(MEDIA_DIR, `${Date.now()}_${fileId.slice(-8)}${ext}`);
-  renameSync(tmpPath, destPath);
+  try {
+    renameSync(tmpPath, destPath);
+  } catch {
+    copyFileSync(tmpPath, destPath);
+    unlinkSync(tmpPath);
+  }
   return destPath;
 }
 
@@ -363,6 +394,46 @@ async function transcribeVoice(filePath) {
   });
 }
 
+// ─── MARKDOWN → TELEGRAM HTML ────────────────────────────────────────────────
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function mdToTgHtml(text) {
+  if (!text) return "";
+  let result = text;
+
+  // Code blocks: ```lang\n...\n``` → <pre>...</pre>
+  result = result.replace(/```[\w]*\n([\s\S]*?)```/g, (_, code) => {
+    return `<pre>${escapeHtml(code.trim())}</pre>`;
+  });
+
+  // Inline code: `...` → <code>...</code>
+  result = result.replace(/`([^`]+)`/g, (_, code) => {
+    return `<code>${escapeHtml(code)}</code>`;
+  });
+
+  // Bold: **text** or __text__
+  result = result.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+  result = result.replace(/__(.+?)__/g, "<b>$1</b>");
+
+  // Italic: *text* or _text_
+  result = result.replace(/(?<!\w)\*([^*]+)\*(?!\w)/g, "<i>$1</i>");
+  result = result.replace(/(?<!\w)_([^_]+)_(?!\w)/g, "<i>$1</i>");
+
+  // Links: [text](url)
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+
+  // Headings: remove # prefix, make bold
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+
+  return result;
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function getStatusText() {
@@ -452,16 +523,36 @@ function getMemoryText() {
 }
 
 async function sendResponse(ctx, text) {
-  if (text.length <= 4096) {
-    await ctx.reply(text, { reply_markup: mainKeyboard });
-  } else {
-    const chunks = [];
-    for (let i = 0; i < text.length; i += 4096) {
-      chunks.push(text.slice(i, i + 4096));
+  const html = mdToTgHtml(text);
+
+  if (html.length <= 4096) {
+    try {
+      await ctx.reply(html, { parse_mode: "HTML", reply_markup: mainKeyboard });
+    } catch {
+      // Fallback: if HTML parsing fails, send as plain text
+      await ctx.reply(text, { reply_markup: mainKeyboard });
     }
-    for (let i = 0; i < chunks.length; i++) {
-      const markup = i === chunks.length - 1 ? { reply_markup: mainKeyboard } : {};
-      await ctx.reply(chunks[i], markup);
+  } else {
+    // Split on double newlines to keep paragraphs intact
+    const parts = [];
+    let current = "";
+    for (const para of html.split("\n\n")) {
+      if (current.length + para.length + 2 > 4096) {
+        if (current) parts.push(current);
+        current = para;
+      } else {
+        current = current ? current + "\n\n" + para : para;
+      }
+    }
+    if (current) parts.push(current);
+
+    for (let i = 0; i < parts.length; i++) {
+      const markup = i === parts.length - 1 ? { reply_markup: mainKeyboard } : {};
+      try {
+        await ctx.reply(parts[i], { parse_mode: "HTML", ...markup });
+      } catch {
+        await ctx.reply(parts[i].replace(/<[^>]+>/g, ""), markup);
+      }
     }
   }
 }
@@ -473,6 +564,18 @@ bot.api.config.use(autoRetry());
 
 // /start
 bot.command("start", async (ctx) => {
+  // Auto-lock: first user to /start becomes the owner
+  if (!_ownerId) {
+    saveOwner(ctx);
+    await ctx.reply(
+      "Привет! Я твой персональный AI-агент.\n\n" +
+      "Я привязался к твоему аккаунту и буду отвечать только тебе.\n\n" +
+      "Пиши мне текстом, отправляй голосовые, фото или файлы — я помогу с любыми задачами.\n\n" +
+      "Используй кнопки внизу или просто пиши.",
+      { reply_markup: mainKeyboard }
+    );
+    return;
+  }
   if (!isOwner(ctx)) return;
   await ctx.reply(
     "Привет! Я твой персональный AI-агент.\n\n" +
