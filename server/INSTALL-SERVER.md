@@ -204,12 +204,11 @@ cd /home/agent/.agent/bot && npm install --production 2>&1 | tail -5 && echo OK
 cat > /home/agent/.agent/.env << 'ENVEOF'
 BOT_TOKEN=ТОКЕН_БОТА
 AGENT_HOME=/home/agent
-OWNER_ID=ID_ВЛАДЕЛЬЦА
 ENVEOF
 ```
 Замени `ТОКЕН_БОТА` на значение из сообщения пользователя.
 
-`OWNER_ID` — Telegram ID пользователя. Узнай его: попроси пользователя отправить любое сообщение боту @userinfobot в Telegram, он покажет ID (число). Если пользователь не знает свой ID — можно оставить пустым (бот будет отвечать всем), но лучше указать для безопасности.
+**Опционально: защита бота.** Если пользователь хочет чтобы бот отвечал только ему — добавь строку `OWNER_ID=ЧИСЛО` в .env, где ЧИСЛО — Telegram ID пользователя. Узнать его можно через бота @userinfobot в Telegram. Если OWNER_ID не указан — бот отвечает всем.
 
 **7.4. Авторизуй Claude Code через подписку.**
 
@@ -230,14 +229,14 @@ ENVEOF
 
 Жди ответа пользователя. Когда скажет «готово» — продолжай.
 
-**7.5. Установи systemd-сервис:**
+**7.5. Поправь владельца файлов (ВАЖНО — до запуска бота!):**
 ```
-curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/agent-bot.service -o /etc/systemd/system/agent-bot.service && systemctl daemon-reload && systemctl enable agent-bot && systemctl start agent-bot && echo OK
+chown -R agent:agent /home/agent/.agent
 ```
 
-**7.6. Поправь владельца и проверь:**
+**7.6. Установи systemd-сервис и запусти:**
 ```
-chown -R agent:agent /home/agent/.agent && sleep 3 && systemctl status agent-bot --no-pager -l 2>&1 | head -15
+curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/bot/agent-bot.service -o /etc/systemd/system/agent-bot.service && systemctl daemon-reload && systemctl enable agent-bot && systemctl start agent-bot && sleep 3 && systemctl status agent-bot --no-pager -l 2>&1 | head -15
 ```
 
 Если бот запустился — скажи пользователю:
