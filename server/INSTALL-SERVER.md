@@ -106,7 +106,7 @@ npm install -g @anthropic-ai/claude-code 2>&1 | tail -5 && which claude
 
 **3.4. Пользователь agent и папки:**
 ```
-id agent 2>/dev/null || useradd -m -s /bin/bash agent && mkdir -p /home/agent/workspace /home/agent/projects /home/agent/.agent/bot && chown -R agent:agent /home/agent && echo OK
+id agent 2>/dev/null || useradd -m -s /bin/bash agent && mkdir -p /home/agent/workspace/memory /home/agent/workspace/knowledge /home/agent/projects /home/agent/.agent/bot && chown -R agent:agent /home/agent && echo OK
 ```
 
 **3.5. Права на Claude Code для пользователя agent:**

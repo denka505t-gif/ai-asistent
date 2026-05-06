@@ -87,8 +87,10 @@ else
 fi
 
 # Структура папок
-mkdir -p "$HOME_DIR/workspace"
+mkdir -p "$HOME_DIR/workspace/memory"
+mkdir -p "$HOME_DIR/workspace/knowledge"
 mkdir -p "$HOME_DIR/projects"
+mkdir -p "$HOME_DIR/.agent/bot"
 
 # Права
 chown -R "$USERNAME:$USERNAME" "$HOME_DIR"

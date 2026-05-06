@@ -2,14 +2,14 @@
  * Agent Bot — minimal Telegram bot powered by Claude Code CLI
  * Part of jarvis-architect: personal AI agent for course students
  *
- * Features: text + voice → Claude Code → response, sessions, DNA files, typing animation
+ * Features: text + voice → Claude Code → response, sessions, DNA files,
+ *           persistent keyboard, folder structure awareness, typing animation
  */
 
-import { Bot } from "grammy";
+import { Bot, Keyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { createInterface } from "node:readline";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
@@ -21,6 +21,7 @@ import http from "node:http";
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const AGENT_HOME = process.env.AGENT_HOME || "/home/agent";
 const WORKSPACE = join(AGENT_HOME, "workspace");
+const PROJECTS = join(AGENT_HOME, "projects");
 const DATA_DIR = join(AGENT_HOME, ".agent");
 const SESSIONS_FILE = join(DATA_DIR, "sessions.json");
 
@@ -29,8 +30,18 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// Ensure data directory exists
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+// Ensure directories exist
+for (const dir of [DATA_DIR, join(WORKSPACE, "memory"), join(WORKSPACE, "knowledge"), PROJECTS]) {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+}
+
+// ─── PERSISTENT KEYBOARD ────────────────────────────────────────────────────
+
+const mainKeyboard = new Keyboard()
+  .text("📋 Статус").text("🔄 Новый диалог").row()
+  .text("📁 Проекты").text("🧠 Память").row()
+  .resized()
+  .persistent();
 
 // ─── SESSIONS ────────────────────────────────────────────────────────────────
 
@@ -54,8 +65,28 @@ const sessions = loadSessions();
 
 // ─── SYSTEM PROMPT ───────────────────────────────────────────────────────────
 
+const ARCHITECTURE_CONTEXT = `
+## Архитектура файловой системы агента
+
+Ты работаешь на VPS-сервере. Вот структура папок:
+
+- /home/agent/workspace/ — твоя рабочая папка (cwd). Здесь живут DNA-файлы:
+  - CLAUDE.md — правила работы
+  - SOUL.md — твоя личность
+  - MEMORY.md — долгосрочная память (обновляй!)
+  - GOALS.md — цели пользователя
+  - memory/ — дневники по дням (memory/YYYY-MM-DD.md)
+  - knowledge/ — база знаний (справочники, инструкции)
+
+- /home/agent/projects/ — папка для ПРОЕКТОВ. Когда пользователь просит создать проект, сайт, бота, скрипт — создавай папку здесь: /home/agent/projects/название-проекта/
+
+- /home/agent/.agent/ — служебная папка бота (не трогай)
+
+ВАЖНО: новые проекты ВСЕГДА создавай в /home/agent/projects/, НЕ в workspace/. Workspace — только для DNA-файлов и памяти.
+`;
+
 function buildSystemPrompt() {
-  const parts = [];
+  const parts = [ARCHITECTURE_CONTEXT];
 
   // DNA files — read each if exists
   const dnaFiles = ["SOUL.md", "MEMORY.md", "GOALS.md", "CLAUDE.md"];
@@ -77,7 +108,7 @@ function buildSystemPrompt() {
     } catch {}
   }
 
-  return parts.length > 0 ? parts.join("\n\n") : "";
+  return parts.join("\n\n");
 }
 
 // ─── CLAUDE CODE CLI ─────────────────────────────────────────────────────────
@@ -130,7 +161,6 @@ function _callClaudeInner(prompt, sessionId) {
           cost: result.cost_usd || 0,
         });
       } catch {
-        // Sometimes Claude outputs plain text
         const text = stdout.trim();
         resolve({ text: text || "(пустой ответ)", sessionId, cost: 0 });
       }
@@ -188,6 +218,102 @@ async function transcribeVoice(filePath) {
   });
 }
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function getStatusText() {
+  const dnaFiles = ["SOUL.md", "MEMORY.md", "GOALS.md", "CLAUDE.md"];
+  const found = dnaFiles.filter((f) => existsSync(join(WORKSPACE, f)));
+  const missing = dnaFiles.filter((f) => !existsSync(join(WORKSPACE, f)));
+
+  let projectsList = "пусто";
+  try {
+    const dirs = readdirSync(PROJECTS, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+    if (dirs.length > 0) projectsList = dirs.join(", ");
+  } catch {}
+
+  const today = new Date().toISOString().split("T")[0];
+  const hasDiary = existsSync(join(WORKSPACE, "memory", `${today}.md`));
+
+  return (
+    `📋 Статус агента\n\n` +
+    `DNA-файлы: ${found.length}/4 (${found.join(", ")})\n` +
+    `${missing.length > 0 ? `Не найдены: ${missing.join(", ")}\n` : ""}` +
+    `Дневник сегодня: ${hasDiary ? "есть" : "нет"}\n` +
+    `Проекты: ${projectsList}\n\n` +
+    `Workspace: ${WORKSPACE}\n` +
+    `Проекты: ${PROJECTS}`
+  );
+}
+
+function getProjectsText() {
+  let dirs = [];
+  try {
+    dirs = readdirSync(PROJECTS, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {}
+
+  if (dirs.length === 0) {
+    return (
+      `📁 Проекты\n\n` +
+      `Папка проектов пока пустая.\n` +
+      `Путь: ${PROJECTS}\n\n` +
+      `Попросите меня создать проект — я создам его здесь.`
+    );
+  }
+
+  return (
+    `📁 Проекты (${dirs.length})\n\n` +
+    dirs.map((d) => `- ${d}`).join("\n") +
+    `\n\nПуть: ${PROJECTS}`
+  );
+}
+
+function getMemoryText() {
+  const memoryDir = join(WORKSPACE, "memory");
+  let files = [];
+  try {
+    files = readdirSync(memoryDir)
+      .filter((f) => f.endsWith(".md"))
+      .sort()
+      .reverse()
+      .slice(0, 7);
+  } catch {}
+
+  const memoryExists = existsSync(join(WORKSPACE, "MEMORY.md"));
+  let memorySize = 0;
+  if (memoryExists) {
+    try {
+      memorySize = readFileSync(join(WORKSPACE, "MEMORY.md"), "utf8").split("\n").length;
+    } catch {}
+  }
+
+  return (
+    `🧠 Память\n\n` +
+    `MEMORY.md: ${memoryExists ? `${memorySize} строк` : "не найден"}\n\n` +
+    `Последние дневники:\n` +
+    (files.length > 0 ? files.map((f) => `- ${f}`).join("\n") : "пусто") +
+    `\n\nПуть: ${WORKSPACE}/memory/`
+  );
+}
+
+async function sendResponse(ctx, text) {
+  if (text.length <= 4096) {
+    await ctx.reply(text, { reply_markup: mainKeyboard });
+  } else {
+    const chunks = [];
+    for (let i = 0; i < text.length; i += 4096) {
+      chunks.push(text.slice(i, i + 4096));
+    }
+    for (let i = 0; i < chunks.length; i++) {
+      const markup = i === chunks.length - 1 ? { reply_markup: mainKeyboard } : {};
+      await ctx.reply(chunks[i], markup);
+    }
+  }
+}
+
 // ─── TELEGRAM BOT ────────────────────────────────────────────────────────────
 
 const bot = new Bot(BOT_TOKEN);
@@ -198,30 +324,42 @@ bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я твой персональный AI-агент.\n\n" +
     "Пиши мне текстом или отправляй голосовые — я помогу с любыми задачами.\n\n" +
-    "Команды:\n/reset — начать новый диалог\n/status — проверить статус"
+    "Используй кнопки внизу или просто пиши.",
+    { reply_markup: mainKeyboard }
   );
 });
 
-// /reset — clear session
+// /reset
 bot.command("reset", async (ctx) => {
   const userId = String(ctx.from.id);
   sessions.delete(userId);
   saveSessions();
-  await ctx.reply("Сессия сброшена. Начинаем с чистого листа.");
+  await ctx.reply("Сессия сброшена. Начинаем с чистого листа.", { reply_markup: mainKeyboard });
 });
 
 // /status
 bot.command("status", async (ctx) => {
+  await ctx.reply(getStatusText(), { reply_markup: mainKeyboard });
+});
+
+// Button handlers
+bot.hears("📋 Статус", async (ctx) => {
+  await ctx.reply(getStatusText(), { reply_markup: mainKeyboard });
+});
+
+bot.hears("🔄 Новый диалог", async (ctx) => {
   const userId = String(ctx.from.id);
-  const hasSession = sessions.has(userId);
-  const dnaFiles = ["SOUL.md", "MEMORY.md", "GOALS.md", "CLAUDE.md"];
-  const found = dnaFiles.filter((f) => existsSync(join(WORKSPACE, f)));
-  await ctx.reply(
-    `Статус:\n` +
-    `- Сессия: ${hasSession ? "активна" : "новая"}\n` +
-    `- DNA-файлы: ${found.join(", ") || "не найдены"}\n` +
-    `- Workspace: ${WORKSPACE}`
-  );
+  sessions.delete(userId);
+  saveSessions();
+  await ctx.reply("Сессия сброшена. Начинаем с чистого листа.", { reply_markup: mainKeyboard });
+});
+
+bot.hears("📁 Проекты", async (ctx) => {
+  await ctx.reply(getProjectsText(), { reply_markup: mainKeyboard });
+});
+
+bot.hears("🧠 Память", async (ctx) => {
+  await ctx.reply(getMemoryText(), { reply_markup: mainKeyboard });
 });
 
 // Handle text messages
@@ -229,7 +367,6 @@ bot.on("message:text", async (ctx) => {
   const userId = String(ctx.from.id);
   const text = ctx.message.text;
 
-  // Show typing
   const thinkingMsg = await ctx.reply("Думаю... ⏳");
   const typingInterval = setInterval(() => {
     ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
@@ -239,37 +376,26 @@ bot.on("message:text", async (ctx) => {
     const sessionId = sessions.get(userId) || null;
     const result = await callClaude(text, sessionId);
 
-    // Save session
     if (result.sessionId) {
       sessions.set(userId, result.sessionId);
       saveSessions();
     }
 
-    // Delete thinking message and send response
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
-
-    // Split long messages (Telegram limit 4096)
-    const response = result.text;
-    if (response.length <= 4096) {
-      await ctx.reply(response);
-    } else {
-      for (let i = 0; i < response.length; i += 4096) {
-        await ctx.reply(response.slice(i, i + 4096));
-      }
-    }
+    await sendResponse(ctx, result.text);
   } catch (err) {
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[error]", err.message);
-    await ctx.reply("Произошла ошибка. Попробуй ещё раз или /reset для сброса сессии.");
+    await ctx.reply("Произошла ошибка. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
   }
 });
 
 // Handle voice messages
 bot.on("message:voice", async (ctx) => {
   if (!process.env.DEEPGRAM_API_KEY) {
-    return ctx.reply("Голосовые сообщения пока не поддерживаются. Добавь DEEPGRAM_API_KEY в .env");
+    return ctx.reply("Голосовые пока не поддерживаются. Нужен DEEPGRAM_API_KEY в .env", { reply_markup: mainKeyboard });
   }
 
   const thinkingMsg = await ctx.reply("Слушаю голосовое... 🎤");
@@ -278,26 +404,23 @@ bot.on("message:voice", async (ctx) => {
   }, 4000);
 
   try {
-    // Download voice file
     const file = await ctx.getFile();
     const tmpPath = `/tmp/voice_${ctx.from.id}_${Date.now()}.ogg`;
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
     await downloadFile(fileUrl, tmpPath);
 
-    // Transcribe
     const transcript = await transcribeVoice(tmpPath);
     unlinkSync(tmpPath);
 
     if (!transcript) {
       clearInterval(typingInterval);
       await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
-      return ctx.reply("Не удалось распознать голосовое. Попробуй ещё раз.");
+      return ctx.reply("Не удалось распознать голосовое. Попробуй ещё раз.", { reply_markup: mainKeyboard });
     }
 
-    // Show what was recognized
-    await ctx.api.editMessageText(ctx.chat.id, thinkingMsg.message_id, `Распознано: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"\n\nДумаю... ⏳`);
+    await ctx.api.editMessageText(ctx.chat.id, thinkingMsg.message_id,
+      `Распознано: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"\n\nДумаю... ⏳`);
 
-    // Process with Claude
     const userId = String(ctx.from.id);
     const sessionId = sessions.get(userId) || null;
     const result = await callClaude(transcript, sessionId);
@@ -309,20 +432,12 @@ bot.on("message:voice", async (ctx) => {
 
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
-
-    const response = result.text;
-    if (response.length <= 4096) {
-      await ctx.reply(response);
-    } else {
-      for (let i = 0; i < response.length; i += 4096) {
-        await ctx.reply(response.slice(i, i + 4096));
-      }
-    }
+    await sendResponse(ctx, result.text);
   } catch (err) {
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[voice-error]", err.message);
-    await ctx.reply("Ошибка обработки голосового. Попробуй текстом или /reset.");
+    await ctx.reply("Ошибка обработки голосового. Попробуй текстом.", { reply_markup: mainKeyboard });
   }
 });
 
@@ -331,6 +446,6 @@ bot.on("message:voice", async (ctx) => {
 bot.catch((err) => console.error("[bot-error]", err.message));
 
 bot.start({
-  onStart: () => console.log(`Agent bot started (workspace: ${WORKSPACE})`),
+  onStart: () => console.log(`Agent bot started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`),
   drop_pending_updates: true,
 });
