@@ -100,15 +100,10 @@ log "Папки готовы: workspace/ (файлы агента), projects/ (�
 step "5/6. VS Code Tunnel"
 if ! command -v code &>/dev/null; then
   log "Скачиваю VS Code CLI..."
-  ARCH=$(uname -m)
-  if [ "$ARCH" = "x86_64" ]; then
-    VS_URL="https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64"
-  elif [ "$ARCH" = "aarch64" ]; then
-    VS_URL="https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-arm64"
-  else
-    VS_URL="https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64"
-  fi
-  curl -fL "$VS_URL" -o /tmp/vscode.tar.gz 2>&1 || warn "Ошибка скачивания VS Code CLI"
+  # Сначала пробуем GitHub (работает на Beget), потом официальный сайт
+  GH_URL="https://github.com/Ntmib/jarvis-architect/releases/download/v1.0.0/vscode-cli.tar.gz"
+  VS_URL="https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64"
+  curl -fL "$GH_URL" -o /tmp/vscode.tar.gz 2>&1 || curl -fL "$VS_URL" -o /tmp/vscode.tar.gz 2>&1 || warn "Ошибка скачивания VS Code CLI"
   if [ -f /tmp/vscode.tar.gz ] && [ "$(wc -c < /tmp/vscode.tar.gz)" -gt 1000 ]; then
     tar -xzf /tmp/vscode.tar.gz -C /usr/local/bin/ 2>&1
     rm -f /tmp/vscode.tar.gz
