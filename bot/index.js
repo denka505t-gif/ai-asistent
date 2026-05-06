@@ -180,9 +180,9 @@ function _cachedRead(path) {
 function buildSystemPrompt() {
   const parts = [];
 
-  // 1. CLAUDE.md — main rules (cached by mtime)
-  const sysRules = _cachedRead(SYSTEM_PROMPT_PATH);
-  if (sysRules) parts.push(sysRules);
+  // 1. CLAUDE.md is auto-loaded by Claude Code CLI from cwd (WORKSPACE)
+  //    We do NOT inject it here to avoid double-loading and wasting tokens.
+  //    Only inject what Claude CLI doesn't see: DNA files, diaries, architecture.
 
   // 2. Architecture context
   parts.push(ARCHITECTURE_CONTEXT);
@@ -819,7 +819,7 @@ function confirmKeyboard() {
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function getStatusText() {
-  const dnaFiles = ["SOUL.md", "MEMORY.md", "GOALS.md", "CLAUDE.md", "USER.md", "MISSION.md", "PROJECTS.md", "PREFERENCES.md"];
+  const dnaFiles = ["SOUL.md", "USER.md", "MEMORY.md", "MISSION.md", "GOALS.md", "PROJECTS.md", "PREFERENCES.md", "LEARNED.md"];
   const found = dnaFiles.filter((f) => existsSync(join(WORKSPACE, f)));
   const missing = dnaFiles.filter((f) => !existsSync(join(WORKSPACE, f)));
 

@@ -111,11 +111,16 @@ expect -c '
 '
 ```
 
-Скопируй все DNA-файлы:
+Скопируй все DNA-файлы (9 штук):
 - CLAUDE.md
 - SOUL.md
+- USER.md
 - MEMORY.md
+- MISSION.md
 - GOALS.md
+- PROJECTS.md
+- PREFERENCES.md
+- LEARNED.md
 - memory/README.md (и содержимое memory/ если есть дневники)
 - knowledge/README.md (и содержимое knowledge/ если есть файлы)
 - .claude/ (папка со скиллами, если есть)
