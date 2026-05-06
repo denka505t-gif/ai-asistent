@@ -154,9 +154,15 @@ expect -c '
 **Настройки Claude Code (.claude/):**
 7. Если у пользователя есть локальная папка `.claude/` — скопируй её в `/home/agent/.claude/` (НЕ в workspace!). Это настройки Claude Code: settings.json (правила светофора) и skills/ (навыки).
 
-Если `.claude/` нет локально — скачай дефолтные настройки из репозитория:
+Если `.claude/` нет локально — скачай дефолтные настройки и скиллы из репозитория:
 ```
 curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/.claude/settings.json -o /home/agent/.claude/settings.json
+```
+
+**Установи скиллы (навыки агента):**
+Скиллы — это готовые инструкции, которые усиливают агента. Скачай 4 базовых скилла:
+```
+for SKILL in discovery-interview content-creator fullstack-developer frontend-design; do mkdir -p /home/agent/.claude/skills/$SKILL && curl -fsSL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/.claude/skills/$SKILL/SKILL.md -o /home/agent/.claude/skills/$SKILL/SKILL.md; done && echo OK
 ```
 
 После копирования — поправь владельца:

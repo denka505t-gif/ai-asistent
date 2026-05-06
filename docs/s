@@ -101,6 +101,17 @@ if [ ! -f "$HOME_DIR/.claude/settings.json" ]; then
     || warn "Не удалось скачать settings.json — можно добавить позже"
 fi
 
+# Скиллы (навыки агента)
+SKILLS_BASE="https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/.claude/skills"
+for SKILL in discovery-interview content-creator fullstack-developer frontend-design; do
+  if [ ! -f "$HOME_DIR/.claude/skills/$SKILL/SKILL.md" ]; then
+    mkdir -p "$HOME_DIR/.claude/skills/$SKILL"
+    curl -fsSL "$SKILLS_BASE/$SKILL/SKILL.md" \
+      -o "$HOME_DIR/.claude/skills/$SKILL/SKILL.md" 2>/dev/null || true
+  fi
+done
+log "Скиллы установлены (4 навыка)"
+
 # Права
 chown -R "$USERNAME:$USERNAME" "$HOME_DIR"
 log "Папки готовы: workspace/ (файлы агента), projects/ (проекты)"
