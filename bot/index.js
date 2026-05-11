@@ -1267,7 +1267,13 @@ bot.catch((err) => {
 });
 
 bot.start({
-  onStart: () => {
+  onStart: async () => {
+    await bot.api.setMyCommands([
+      { command: "start", description: "Меню" },
+      { command: "reset", description: "Новая сессия" },
+      { command: "status", description: "Статус системы" },
+      { command: "settings", description: "Подключить API-ключи" },
+    ]);
     console.log(`Agent bot started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`);
     if (_ownerId) console.log(`Owner: ${_ownerId} (only owner can use bot)`);
     else console.log("No owner yet — first /start will auto-lock");
