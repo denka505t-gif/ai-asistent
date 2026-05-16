@@ -307,23 +307,11 @@ export async function handlePendingInput(ctx) {
  * @param {(ctx) => boolean} isOwner — функция-проверка владельца
  * @param {Keyboard} mainKeyboard — основная persistent-клавиатура (для ответов после действий)
  */
-export function registerSecretsHandlers(bot, isOwner, mainKeyboard) {
-  // Команда /settings — открывает меню секретов
-  bot.command("settings", async (ctx) => {
-    if (!isOwner(ctx)) return;
-    await ctx.reply(
-      "<b>🔑 Переменные окружения</b>\n\n" +
-      "Подключи сервисы — Агент станет мощнее.\n" +
-      "<i>Все значения хранятся локально на твоём сервере в зашифрованном файле, " +
-      "видны только тебе.</i>",
-      {
-        parse_mode: "HTML",
-        reply_markup: envKeyboard(),
-      }
-    );
-  });
+export function registerSecretsHandlers(bot, isOwner) {
+  // NOTE: /settings command is now in index.js (full settings menu).
+  // This module only registers env-related callbacks.
 
-  // settings_env — повторное открытие меню (из callback)
+  // settings_env — открытие меню env (из settings callback)
   bot.callbackQuery("settings_env", async (ctx) => {
     if (!isOwner(ctx)) return ctx.answerCallbackQuery();
     await ctx.answerCallbackQuery();

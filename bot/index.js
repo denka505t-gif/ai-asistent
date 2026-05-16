@@ -10,7 +10,7 @@
  *           model selection, bootstrap, auto-continue, text batching
  */
 
-import { Bot, Keyboard, InlineKeyboard, InputFile } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync, statSync } from "node:fs";
@@ -64,6 +64,7 @@ function loadState() {
   } catch {
     return {
       model: "sonnet",
+      mode: "normal",
       timezone: "Europe/Moscow",
       bootstrapDone: false,
       dailySpendLimit: 50,
@@ -223,13 +224,28 @@ function isOwner(ctx) {
   return String(ctx.from?.id) === String(_ownerId);
 }
 
-// ─── PERSISTENT KEYBOARD ────────────────────────────────────────────────────
+// ─── SPEND TRACKING ─────────────────────────────────────────────────────────
 
-const mainKeyboard = new Keyboard()
-  .text("📋 Статус").text("🔄 Новый диалог").row()
-  .text("📁 Проекты").text("🧠 Память").row()
-  .resized()
-  .persistent();
+function recordSpend(cost) {
+  if (!cost) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (!state.costHistory) state.costHistory = {};
+  state.costHistory[today] = (state.costHistory[today] || 0) + cost;
+  saveState(state);
+}
+
+function getTodaySpend() {
+  const today = new Date().toISOString().slice(0, 10);
+  return state.costHistory?.[today] || 0;
+}
+
+function checkSpendLimit() {
+  const spent = getTodaySpend();
+  const limit = state.dailySpendLimit || 50;
+  if (spent >= limit) return "blocked";
+  if (spent >= limit * 0.8) return "warning";
+  return "ok";
+}
 
 // ─── SESSIONS ────────────────────────────────────────────────────────────────
 
@@ -469,6 +485,12 @@ async function prefetchUrls(text) {
 
 // Sequential queue — only one Claude call at a time
 let _queue = Promise.resolve();
+let _activeChild = null; // Track running Claude process for /stop
+let _activeThinkingMsgId = null; // Track thinking message for /stop
+
+function isCliBusy() {
+  return _activeChild !== null;
+}
 
 function callClaude(prompt, sessionId, { onText } = {}) {
   const p = _queue.then(() => _callClaudeInner(prompt, sessionId, { onText }));
@@ -514,6 +536,8 @@ function _callClaudeInner(prompt, sessionId, { onText } = {}) {
       env: { ...process.env, HOME: AGENT_HOME },
       timeout: 600000, // 10 min
     });
+    _activeChild = child;
+    child.on("close", () => { if (_activeChild === child) _activeChild = null; });
     child.stdin.end();
 
     let stdout = "";
@@ -570,6 +594,7 @@ function _callClaudeInner(prompt, sessionId, { onText } = {}) {
             }
           } catch {}
         }
+        recordSpend(cost);
         resolve({
           text: lastText || "(пустой ответ)",
           sessionId: resultSessionId,
@@ -589,10 +614,12 @@ function _callClaudeInner(prompt, sessionId, { onText } = {}) {
       }
       try {
         const result = JSON.parse(stdout);
+        const rcost = result.cost_usd || 0;
+        recordSpend(rcost);
         resolve({
           text: result.result || result.text || "(пустой ответ)",
           sessionId: result.session_id || sessionId,
-          cost: result.cost_usd || 0,
+          cost: rcost,
         });
       } catch {
         const text = stdout.trim();
@@ -754,7 +781,7 @@ async function processMediaBatch(key) {
     await ctx.api.deleteMessage(chatId, statusMsgId).catch(() => {});
     console.error("[media-error]", err.message);
     const friendly = humanizeError(err.message);
-    await ctx.reply(friendly || "Ошибка обработки медиа. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
+    await ctx.reply(friendly || "Ошибка обработки медиа. Попробуй ещё раз или нажми 🔄 Новый диалог.");
   }
 }
 
@@ -956,8 +983,8 @@ function needsConfirmation(text) {
 
 function confirmKeyboard() {
   return new InlineKeyboard()
-    .text("✔ Продолжай", "confirm_yes")
-    .text("✖ Стоп", "confirm_no");
+    .text("✔ Продолжай", "confirm_continue")
+    .text("✖ Стоп", "confirm_stop");
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -1103,20 +1130,20 @@ async function sendResponse(ctx, text) {
   if (html.length <= CHUNK_HARD_LIMIT) {
     const replyOpts = {
       parse_mode: "HTML",
-      reply_markup: hasConfirmation ? confirmKeyboard() : mainKeyboard,
+      ...(hasConfirmation ? { reply_markup: confirmKeyboard() } : {}),
     };
     try {
       await ctx.reply(html, replyOpts);
     } catch {
       // Fallback: if HTML parsing fails, send as plain text
-      await ctx.reply(cleaned, { reply_markup: mainKeyboard });
+      await ctx.reply(cleaned);
     }
   } else {
     const chunks = sendChunked(html);
     for (let i = 0; i < chunks.length; i++) {
       const isLast = i === chunks.length - 1;
-      const markup = isLast
-        ? { reply_markup: hasConfirmation ? confirmKeyboard() : mainKeyboard }
+      const markup = (isLast && hasConfirmation)
+        ? { reply_markup: confirmKeyboard() }
         : {};
       try {
         await ctx.reply(chunks[i], { parse_mode: "HTML", ...markup });
@@ -1376,14 +1403,69 @@ async function processTextBatch(userId) {
 
 // ─── MODEL SELECTION ────────────────────────────────────────────────────────
 
-const MODEL_MAP = {
-  sonnet: "sonnet",
-  opus: "opus",
-  haiku: "haiku",
-};
-
 function getCurrentModel() {
   return state.model || "sonnet";
+}
+
+// ─── SETTINGS MENU (AF-compatible) ─────────────────────────────────────────
+
+function settingsKeyboard() {
+  const modelEmoji = state.model === "opus" ? "🟣" : state.model === "haiku" ? "🟢" : "🔵";
+  const modeEmoji = state.mode === "auto" ? "🤖" : "👤";
+  const spent = getTodaySpend();
+  const limit = state.dailySpendLimit || 50;
+
+  return new InlineKeyboard()
+    .text(`${modelEmoji} Модель: ${state.model || "sonnet"}`, "settings_model").row()
+    .text(`${modeEmoji} Режим: ${state.mode || "normal"}`, "settings_mode").row()
+    .text(`🔑 Переменные окружения`, "settings_env").row()
+    .text(`🕐 Часовой пояс: ${state.timezone || "Europe/Moscow"}`, "settings_tz").row()
+    .text(`💰 Лимит: $${limit}/день (потрачено: $${spent.toFixed(2)})`, "settings_spend_limit").row()
+    .text(`🔄 Перезагрузка`, "settings_restart").row()
+    .text(`✖ Закрыть`, "settings_close");
+}
+
+function modelKeyboard() {
+  return new InlineKeyboard()
+    .text(state.model === "haiku" ? "✅ Haiku" : "Haiku", "model_haiku")
+    .text(state.model === "sonnet" ? "✅ Sonnet" : "Sonnet", "model_sonnet")
+    .text(state.model === "opus" ? "✅ Opus" : "Opus", "model_opus")
+    .row()
+    .text("← Назад", "settings_back");
+}
+
+function modeKeyboard() {
+  return new InlineKeyboard()
+    .text(state.mode === "normal" ? "✅ Обычный" : "Обычный", "mode_normal")
+    .text(state.mode === "auto" ? "✅ Авто" : "Авто", "mode_auto")
+    .row()
+    .text("← Назад", "settings_back");
+}
+
+const tzList = [
+  "UTC", "Europe/Moscow", "Europe/Kiev", "Asia/Almaty",
+  "Asia/Vladivostok", "America/New_York", "America/Los_Angeles",
+];
+
+function tzKeyboard() {
+  const kb = new InlineKeyboard();
+  for (const tz of tzList) {
+    const label = state.timezone === tz ? `✅ ${tz}` : tz;
+    kb.text(label, `tz_${tz}`).row();
+  }
+  kb.text("← Назад", "settings_back");
+  return kb;
+}
+
+function spendLimitKeyboard() {
+  const limits = [10, 25, 50, 100, 200];
+  const kb = new InlineKeyboard();
+  for (const l of limits) {
+    const label = state.dailySpendLimit === l ? `✅ $${l}` : `$${l}`;
+    kb.text(label, `spend_${l}`);
+  }
+  kb.row().text("← Назад", "settings_back");
+  return kb;
 }
 
 // ─── TELEGRAM BOT ────────────────────────────────────────────────────────────
@@ -1391,11 +1473,100 @@ function getCurrentModel() {
 const bot = new Bot(BOT_TOKEN);
 bot.api.config.use(autoRetry());
 
-// Меню /settings → 🔑 Переменные окружения (модуль secrets-menu.js)
-registerSecretsHandlers(bot, isOwner, mainKeyboard);
+// Env callbacks (модуль secrets-menu.js — только callbacks, не /settings)
+registerSecretsHandlers(bot, isOwner);
 
 // Подсказка при первом голосовом без распознавалки (модуль voice-helper.js)
 registerVoiceHelpers(bot, isOwner);
+
+// /settings — full settings menu (AF-compatible)
+bot.command("settings", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply("⚙️ Настройки", { reply_markup: settingsKeyboard() });
+});
+
+// Settings callbacks
+bot.callbackQuery("settings_model", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("Выбери модель:", { reply_markup: modelKeyboard() });
+});
+
+bot.callbackQuery("settings_mode", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(
+    "Обычный — Claude спрашивает перед действиями\nАвто — Claude действует самостоятельно",
+    { reply_markup: modeKeyboard() }
+  );
+});
+
+bot.callbackQuery("settings_tz", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("Выбери часовой пояс:", { reply_markup: tzKeyboard() });
+});
+
+bot.callbackQuery("settings_spend_limit", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("Дневной лимит расхода:", { reply_markup: spendLimitKeyboard() });
+});
+
+bot.callbackQuery("settings_restart", async (ctx) => {
+  await ctx.answerCallbackQuery("Перезагрузка...");
+  await ctx.editMessageText("Перезагружаюсь...");
+  setTimeout(() => process.exit(0), 500);
+});
+
+bot.callbackQuery("settings_close", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.deleteMessage();
+});
+
+bot.callbackQuery("settings_back", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("⚙️ Настройки", { reply_markup: settingsKeyboard() });
+});
+
+// Model selection callbacks
+bot.callbackQuery(/^model_/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const model = ctx.callbackQuery.data.replace("model_", "");
+  if (["haiku", "sonnet", "opus"].includes(model)) {
+    state.model = model;
+    saveState(state);
+    await ctx.editMessageText("Выбери модель:", { reply_markup: modelKeyboard() });
+  }
+});
+
+// Mode selection callbacks
+bot.callbackQuery(/^mode_/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const mode = ctx.callbackQuery.data.replace("mode_", "");
+  if (["normal", "auto"].includes(mode)) {
+    state.mode = mode;
+    saveState(state);
+    await ctx.editMessageText(
+      "Обычный — Claude спрашивает перед действиями\nАвто — Claude действует самостоятельно",
+      { reply_markup: modeKeyboard() }
+    );
+  }
+});
+
+// Timezone selection callbacks
+bot.callbackQuery(/^tz_/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const tz = ctx.callbackQuery.data.replace("tz_", "");
+  state.timezone = tz;
+  saveState(state);
+  await ctx.editMessageText("Выбери часовой пояс:", { reply_markup: tzKeyboard() });
+});
+
+// Spend limit selection callbacks
+bot.callbackQuery(/^spend_/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const limit = parseInt(ctx.callbackQuery.data.replace("spend_", ""));
+  state.dailySpendLimit = limit;
+  saveState(state);
+  await ctx.editMessageText("Дневной лимит расхода:", { reply_markup: spendLimitKeyboard() });
+});
 
 // /start — with bootstrap trigger
 bot.command("start", async (ctx) => {
@@ -1413,7 +1584,7 @@ bot.command("start", async (ctx) => {
       "Привет! Я твой персональный AI-агент.\n\n" +
       "Давай настроим меня под тебя — это займёт 1 минуту (6 вопросов).\n\n" +
       BOOTSTRAP_STEPS.ask_name.question,
-      { reply_markup: mainKeyboard }
+      {}
     );
     return;
   }
@@ -1421,9 +1592,8 @@ bot.command("start", async (ctx) => {
   await ctx.reply(
     "Привет! Я твой персональный AI-агент.\n\n" +
     "Пиши мне текстом, отправляй голосовые, фото или файлы — я помогу с любыми задачами.\n\n" +
-    "Используй кнопки внизу или просто пиши.\n\n" +
-    "/settings — подключить API-ключи\n/model — выбрать модель\n/update — обновить бота",
-    { reply_markup: mainKeyboard }
+    "Просто пиши мне текстом, отправляй голосовые, фото или файлы.\n\n" +
+    "/settings — настройки\n/reset — новая сессия\n/status — статус системы"
   );
 });
 
@@ -1441,14 +1611,13 @@ bot.callbackQuery("bootstrap_confirm", async (ctx) => {
     bootstrapStep.delete(userId);
     bootstrapData.delete(userId);
     await ctx.reply(
-      "ДНК создана! Все 8 файлов записаны.\n\n" +
-      "Теперь просто пиши мне — я знаю кто ты и чем могу помочь.\n\n" +
-      "/settings — подключить API-ключи\n/model — выбрать модель",
-      { reply_markup: mainKeyboard }
+      "✅ ДНК создана! Все 8 файлов записаны.\n\n" +
+      "Теперь просто пиши — я готов работать.\n\n" +
+      "/settings — настройки"
     );
   } catch (err) {
     console.error("[bootstrap]", err.message);
-    await ctx.reply("Ошибка при создании ДНК: " + err.message.slice(0, 200), { reply_markup: mainKeyboard });
+    await ctx.reply("Ошибка при создании ДНК: " + err.message.slice(0, 200));
   }
 });
 
@@ -1460,28 +1629,10 @@ bot.callbackQuery("bootstrap_restart", async (ctx) => {
   await ctx.reply("Начинаем заново.\n\n" + BOOTSTRAP_STEPS.ask_name.question);
 });
 
-// /model — select Claude model
+// /model — redirect to settings (command still works, but not in menu)
 bot.command("model", async (ctx) => {
   if (!isOwner(ctx)) return;
-  const current = getCurrentModel();
-  const kb = new InlineKeyboard()
-    .text(current === "sonnet" ? "Sonnet \u2714" : "Sonnet", "model_sonnet")
-    .text(current === "opus" ? "Opus \u2714" : "Opus", "model_opus")
-    .text(current === "haiku" ? "Haiku \u2714" : "Haiku", "model_haiku");
-  await ctx.reply(`Текущая модель: <b>${current}</b>\n\nВыбери модель:`, {
-    parse_mode: "HTML",
-    reply_markup: kb,
-  });
-});
-
-bot.callbackQuery(/^model_/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const model = ctx.callbackQuery.data.replace("model_", "");
-  if (MODEL_MAP[model]) {
-    state.model = MODEL_MAP[model];
-    saveState(state);
-    await ctx.editMessageText(`Модель переключена на <b>${model}</b>`, { parse_mode: "HTML" });
-  }
+  await ctx.reply("Выбери модель:", { reply_markup: modelKeyboard() });
 });
 
 // /reset
@@ -1490,13 +1641,47 @@ bot.command("reset", async (ctx) => {
   const userId = String(ctx.from.id);
   sessions.delete(userId);
   saveSessions();
-  await ctx.reply("Сессия сброшена. Начинаем с чистого листа.", { reply_markup: mainKeyboard });
+  await ctx.reply("🧹 Сессия сброшена. Начинаем с чистого листа.");
 });
 
-// /status
+// /stop — kill active Claude process
+bot.command("stop", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  if (!_activeChild && !isCliBusy()) {
+    await ctx.reply("Нет активной задачи.");
+    return;
+  }
+  if (_activeChild) {
+    _activeChild.kill("SIGTERM");
+    setTimeout(() => { if (_activeChild) _activeChild.kill("SIGKILL"); }, 3000);
+  }
+  if (_activeThinkingMsgId) {
+    try {
+      await ctx.api.editMessageText(ctx.chat.id, _activeThinkingMsgId, "⏹ Задача остановлена.");
+    } catch {}
+    _activeThinkingMsgId = null;
+  }
+  console.warn("[/stop] Task stopped by user");
+});
+
+// /status — extended info
 bot.command("status", async (ctx) => {
   if (!isOwner(ctx)) return;
-  await ctx.reply(getStatusText(), { reply_markup: mainKeyboard });
+  const spent = getTodaySpend();
+  const limit = state.dailySpendLimit || 50;
+  const spendStatus = checkSpendLimit();
+  const spendIcon = spendStatus === "blocked" ? "🔴" : spendStatus === "warning" ? "🟡" : "🟢";
+
+  const status =
+    `<b>Agent v${BOT_VERSION}</b>\n\n` +
+    `<b>Модель:</b> ${state.model || "sonnet"}\n` +
+    `<b>Режим:</b> ${state.mode || "normal"}\n` +
+    `<b>Часовой пояс:</b> ${state.timezone || "Europe/Moscow"}\n` +
+    `<b>Bootstrap:</b> ${state.bootstrapDone ? "✅" : "⏳"}\n` +
+    `<b>Сессия:</b> ${sessions.has(String(ctx.from.id)) ? "активна" : "нет"}\n\n` +
+    `${spendIcon} <b>Расход сегодня:</b> $${spent.toFixed(2)} / $${limit}`;
+
+  await ctx.reply(status, { parse_mode: "HTML" });
 });
 
 // /update — self-update from GitHub
@@ -1508,7 +1693,7 @@ bot.command("update", async (ctx) => {
     catch { return "unknown"; }
   })();
 
-  await ctx.reply(`Проверяю обновления... (текущая версия: ${currentVer})`, { reply_markup: mainKeyboard });
+  await ctx.reply(`Проверяю обновления... (текущая версия: ${currentVer})`);
 
   try {
     // Check remote version
@@ -1525,7 +1710,7 @@ bot.command("update", async (ctx) => {
     });
 
     if (remoteVer === currentVer) {
-      await ctx.reply(`У тебя последняя версия (${currentVer}).`, { reply_markup: mainKeyboard });
+      await ctx.reply(`У тебя последняя версия (${currentVer}).`);
       return;
     }
 
@@ -1551,13 +1736,13 @@ bot.command("update", async (ctx) => {
 
     // If we get here, the bot hasn't restarted yet (no systemd)
     const lines = result.split("\n").filter(l => l.includes("===") || l.includes("ERROR") || l.includes("WARN"));
-    await ctx.reply(lines.join("\n") || "Обновление завершено. Бот перезапустится.", { reply_markup: mainKeyboard });
+    await ctx.reply(lines.join("\n") || "Обновление завершено. Бот перезапустится.");
 
   } catch (err) {
     console.error("[update]", err.message);
     await ctx.reply(
       `Ошибка обновления: ${err.message.slice(0, 200)}\n\nПопробуй вручную:\nbash update-bot.sh`,
-      { reply_markup: mainKeyboard }
+      {}
     );
   }
 });
@@ -1569,36 +1754,12 @@ bot.command("version", async (ctx) => {
     try { return readFileSync(join(import.meta.dirname, "VERSION"), "utf8").trim(); }
     catch { return "unknown"; }
   })();
-  await ctx.reply(`Agent Bot v${ver}`, { reply_markup: mainKeyboard });
-});
-
-// Button handlers
-bot.hears("📋 Статус", async (ctx) => {
-  if (!isOwner(ctx)) return;
-  await ctx.reply(getStatusText(), { reply_markup: mainKeyboard });
-});
-
-bot.hears("🔄 Новый диалог", async (ctx) => {
-  if (!isOwner(ctx)) return;
-  const userId = String(ctx.from.id);
-  sessions.delete(userId);
-  saveSessions();
-  await ctx.reply("Сессия сброшена. Начинаем с чистого листа.", { reply_markup: mainKeyboard });
-});
-
-bot.hears("📁 Проекты", async (ctx) => {
-  if (!isOwner(ctx)) return;
-  await ctx.reply(getProjectsText(), { reply_markup: mainKeyboard });
-});
-
-bot.hears("🧠 Память", async (ctx) => {
-  if (!isOwner(ctx)) return;
-  await ctx.reply(getMemoryText(), { reply_markup: mainKeyboard });
+  await ctx.reply(`Agent Bot v${ver}`);
 });
 
 // ─── CONFIRMATION CALLBACKS ─────────────────────────────────────────────────
 
-bot.callbackQuery("confirm_yes", async (ctx) => {
+bot.callbackQuery("confirm_continue", async (ctx) => {
   await ctx.answerCallbackQuery();
   const userId = String(ctx.from.id);
   const sessionId = sessions.get(userId) || null;
@@ -1623,13 +1784,13 @@ bot.callbackQuery("confirm_yes", async (ctx) => {
     clearInterval(typingInterval);
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     const friendly = humanizeError(err.message);
-    await ctx.reply(friendly || "Ошибка. Попробуй ещё раз.", { reply_markup: mainKeyboard });
+    await ctx.reply(friendly || "Ошибка. Попробуй ещё раз.");
   }
 });
 
-bot.callbackQuery("confirm_no", async (ctx) => {
+bot.callbackQuery("confirm_stop", async (ctx) => {
   await ctx.answerCallbackQuery("Остановлено");
-  await ctx.reply("Остановлено. Что делаем дальше?", { reply_markup: mainKeyboard });
+  await ctx.reply("Остановлено. Что делаем дальше?");
 });
 
 // Handle photos (single or media group)
@@ -1745,7 +1906,7 @@ async function handleTextMessage(ctx, text) {
     if (match) setGlobalRateLimit(parseInt(match[1]));
 
     const friendly = humanizeError(err.message);
-    await ctx.reply(friendly || "Произошла ошибка. Попробуй ещё раз или нажми 🔄 Новый диалог.", { reply_markup: mainKeyboard });
+    await ctx.reply(friendly || "Произошла ошибка. Попробуй ещё раз или нажми 🔄 Новый диалог.");
   }
 }
 
@@ -1798,7 +1959,7 @@ bot.on("message:voice", async (ctx) => {
 
       return ctx.reply(
         "Не получилось распознать на этот раз. Попробуй ещё раз или отправь текстом.",
-        { reply_markup: mainKeyboard }
+        {}
       );
     }
 
@@ -1822,7 +1983,7 @@ bot.on("message:voice", async (ctx) => {
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[voice-error]", err.message);
     const friendly = humanizeError(err.message);
-    await ctx.reply(friendly || "Ошибка обработки голосового. Попробуй текстом.", { reply_markup: mainKeyboard });
+    await ctx.reply(friendly || "Ошибка обработки голосового. Попробуй текстом.");
   }
 });
 
@@ -1839,12 +2000,10 @@ bot.start({
   onStart: async () => {
     await bot.api.setMyCommands([
       { command: "start", description: "Меню" },
+      { command: "stop", description: "Остановить задачу" },
       { command: "reset", description: "Новая сессия" },
+      { command: "settings", description: "Настройки" },
       { command: "status", description: "Статус системы" },
-      { command: "settings", description: "Подключить API-ключи" },
-      { command: "model", description: "Выбрать модель Claude" },
-      { command: "update", description: "Обновить бота" },
-      { command: "version", description: "Текущая версия" },
     ]);
 
     // Initialize optional modules
