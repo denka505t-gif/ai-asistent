@@ -406,24 +406,107 @@ function buildSystemPrompt() {
   return result;
 }
 
-// ─── THINKING PHRASES ───────────────────────────────────────────────────────
+// ─── STATUS MESSAGE (typing animation) ──────────────────────────────────────
 
 const THINKING_PHRASES = [
-  ["Думаю...", "⏳"],
-  ["Соображаю...", "🤔"],
-  ["Мозгую...", "🧠"],
-  ["Анализирую...", "🔍"],
-  ["Копаюсь в памяти...", "📚"],
-  ["Обрабатываю...", "⚙️"],
-  ["Почти готов...", "✍️"],
+  ["Думаю…", "⏳"],
+  ["Думаю…", "⌛️"],
+  ["Соображаю…", "🤔"],
+  ["Мозгую…", "🧠"],
+  ["Формулирую…", "🧐"],
+  ["Составляю текст…", "📝"],
+  ["Принимаю решения…", "⚡️"],
+  ["Готовлю план…", "📋"],
+  ["Анализирую…", "🔍"],
+  ["Обрабатываю…", "⚙️"],
 ];
 
-let _phraseIdx = 0;
-function nextThinkingPhrase() {
-  const [text, emoji] = THINKING_PHRASES[_phraseIdx % THINKING_PHRASES.length];
-  _phraseIdx++;
-  return `${text} ${emoji}`;
+function formatThinkingPhrase(index, elapsedSec) {
+  const [text, emoji] = THINKING_PHRASES[index % THINKING_PHRASES.length];
+  const timer = elapsedSec >= 2 ? ` ${elapsedSec}с` : "";
+  return `${text} ${emoji}${timer}`;
 }
+
+class StatusMessage {
+  constructor(ctx, messageId) {
+    this.ctx = ctx;
+    this.chatId = ctx.chat.id;
+    this.messageId = messageId;
+    this.phraseIndex = 0;
+    this.startTime = Date.now();
+    this.typingInterval = null;
+    this.animationInterval = null;
+    this.stopped = false;
+    this.streamingText = "";
+    this.rateLimitedUntil = 0;
+  }
+
+  _activateBreaker(retryAfterSec) {
+    this.rateLimitedUntil = Date.now() + (retryAfterSec * 1000) + 2000;
+    setGlobalRateLimit(retryAfterSec);
+  }
+
+  _isBreakerActive() {
+    return Date.now() < this.rateLimitedUntil || isGloballyRateLimited();
+  }
+
+  start() {
+    this.typingInterval = setInterval(async () => {
+      if (this.stopped || this._isBreakerActive()) return;
+      try {
+        await this.ctx.api.sendChatAction(this.chatId, "typing");
+      } catch (e) {
+        if (e?.error_code === 429) {
+          this._activateBreaker(e?.parameters?.retry_after || 30);
+        }
+      }
+    }, 4000);
+
+    this.animationInterval = setInterval(async () => {
+      if (this.stopped || this.streamingText || this._isBreakerActive()) return;
+      this.phraseIndex = (this.phraseIndex + 1) % THINKING_PHRASES.length;
+      const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+      try {
+        await this.ctx.api.editMessageText(
+          this.chatId, this.messageId,
+          formatThinkingPhrase(this.phraseIndex, elapsed)
+        );
+      } catch (e) {
+        if (e?.error_code === 429) {
+          this._activateBreaker(e?.parameters?.retry_after || 30);
+        }
+      }
+    }, 2000);
+
+    this.ctx.api.sendChatAction(this.chatId, "typing").catch(() => {});
+  }
+
+  async updateStreaming(text) {
+    if (this.stopped) return;
+    this.streamingText = text;
+    if (this._isBreakerActive()) return;
+    const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+    const display = text.length > 3500 ? "…" + text.slice(-3500) : text;
+    const indicator = `\n\n⏳ ${elapsed}с`;
+    try {
+      await this.ctx.api.editMessageText(this.chatId, this.messageId, display + indicator);
+    } catch (e) {
+      if (e?.error_code === 429) {
+        this._activateBreaker(e?.parameters?.retry_after || 30);
+      }
+    }
+  }
+
+  stop() {
+    this.stopped = true;
+    if (this.typingInterval) clearInterval(this.typingInterval);
+    if (this.animationInterval) clearInterval(this.animationInterval);
+    this.typingInterval = null;
+    this.animationInterval = null;
+  }
+}
+
+let _activeStatus = null;
 
 // ─── HUMAN-FRIENDLY ERRORS ──────────────────────────────────────────────────
 
@@ -438,51 +521,97 @@ function humanizeError(errMsg) {
   return null; // unknown error — show generic message
 }
 
-// ─── URL PRE-FETCH ──────────────────────────────────────────────────────────
+// ─── URL PRE-FETCH (with Google Docs/Sheets support) ────────────────────────
 
-function extractUrls(text) {
-  const urlRe = /https?:\/\/[^\s<>"')\]]+/gi;
-  return (text.match(urlRe) || []).slice(0, 3); // max 3 URLs
-}
+const URL_RE = /https?:\/\/[^\s<>"')\]]+/gi;
+const GDOCS_RE = /docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+)/;
+const GSHEETS_RE = /docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/;
 
-async function prefetchUrl(url) {
+function httpGet(url, maxLen = 50000) {
   return new Promise((resolve) => {
-    const proto = url.startsWith("https") ? https : http;
-    const req = proto.get(url, { timeout: 5000, headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
-      if (res.statusCode !== 200) return resolve(null);
+    const mod = url.startsWith("https") ? https : http;
+    const req = mod.get(url, { timeout: 15000, headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return httpGet(res.headers.location, maxLen).then(resolve);
+      }
+      if (res.statusCode !== 200) { resolve(null); res.resume(); return; }
       let data = "";
-      res.on("data", (d) => {
-        data += d;
-        if (data.length > 10000) { res.destroy(); resolve(data.slice(0, 10000)); }
-      });
-      res.on("end", () => resolve(data.slice(0, 10000)));
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { data += chunk; if (data.length > maxLen) { res.destroy(); resolve(data.slice(0, maxLen)); } });
+      res.on("end", () => resolve(data));
+      res.on("error", () => resolve(null));
     });
     req.on("error", () => resolve(null));
     req.on("timeout", () => { req.destroy(); resolve(null); });
   });
 }
 
+function stripHtml(html) {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/h[1-6]>/gi, "\n\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<\/tr>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 async function prefetchUrls(text) {
-  const urls = extractUrls(text);
-  if (urls.length === 0) return "";
-  const results = await Promise.allSettled(urls.map(prefetchUrl));
-  const parts = [];
-  for (let i = 0; i < urls.length; i++) {
-    const val = results[i].status === "fulfilled" ? results[i].value : null;
-    if (val) {
-      // Strip HTML tags for cleaner context
-      const clean = val.replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 3000);
-      if (clean.length > 100) {
-        parts.push(`[Контент с ${urls[i]}]:\n${clean}`);
+  const urls = text.match(URL_RE);
+  if (!urls || urls.length === 0) return "";
+
+  const fetched = [];
+  for (const url of urls.slice(0, 3)) {
+    try {
+      let content = null;
+      let source = url;
+
+      // Google Docs -> export as HTML
+      const gdocMatch = url.match(GDOCS_RE);
+      if (gdocMatch) {
+        const docId = gdocMatch[1];
+        content = await httpGet(`https://docs.google.com/document/d/${docId}/export?format=html`);
+        if (content) {
+          content = stripHtml(content);
+          source = `Google Doc (${docId})`;
+        }
       }
+
+      // Google Sheets -> export as CSV
+      const gsheetMatch = url.match(GSHEETS_RE);
+      if (gsheetMatch && !content) {
+        const sheetId = gsheetMatch[1];
+        content = await httpGet(`https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv`);
+        source = `Google Sheet (${sheetId})`;
+      }
+
+      // Regular URL
+      if (!content) {
+        const raw = await httpGet(url, 10000);
+        if (raw) content = stripHtml(raw);
+      }
+
+      if (content && content.length > 100) {
+        fetched.push({ url, source, content: content.slice(0, 30000) });
+      }
+    } catch (e) {
+      console.error(`[prefetch] Error fetching ${url}:`, e.message);
     }
   }
-  return parts.length > 0 ? "\n\n" + parts.join("\n\n") : "";
+
+  if (fetched.length === 0) return "";
+  return "\n\n" + fetched.map(f =>
+    `--- Содержимое ${f.source} (${f.url}) ---\n${f.content}\n--- Конец документа ---`
+  ).join("\n\n");
 }
 
 // ─── CLAUDE CODE CLI ─────────────────────────────────────────────────────────
@@ -490,7 +619,7 @@ async function prefetchUrls(text) {
 // Sequential queue — only one Claude call at a time
 let _queue = Promise.resolve();
 let _activeChild = null; // Track running Claude process for /stop
-let _activeThinkingMsgId = null; // Track thinking message for /stop
+// _activeStatus is declared above with StatusMessage class
 
 function isCliBusy() {
   return _activeChild !== null;
@@ -758,15 +887,9 @@ async function processMediaBatch(key) {
   const caption = batch.caption || "";
   const prompt = `${mediaIntro}\n${filesBlock}${caption ? `\n\nПодпись пользователя: ${caption}` : ""}`;
 
-  try {
-    await ctx.api.editMessageText(chatId, statusMsgId, nextThinkingPhrase());
-  } catch {}
-
-  const typingInterval = setInterval(() => {
-    if (!isGloballyRateLimited()) {
-      ctx.api.sendChatAction(chatId, "typing").catch(() => {});
-    }
-  }, 4000);
+  const status = new StatusMessage(ctx, statusMsgId);
+  _activeStatus = status;
+  status.start();
 
   try {
     const sessionId = sessions.get(userId) || null;
@@ -777,11 +900,13 @@ async function processMediaBatch(key) {
       saveSessions();
     }
 
-    clearInterval(typingInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(chatId, statusMsgId).catch(() => {});
     await sendResponse(ctx, result.text);
   } catch (err) {
-    clearInterval(typingInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(chatId, statusMsgId).catch(() => {});
     console.error("[media-error]", err.message);
     const friendly = humanizeError(err.message);
@@ -1657,11 +1782,12 @@ bot.command("stop", async (ctx) => {
     _activeChild.kill("SIGTERM");
     setTimeout(() => { if (_activeChild) _activeChild.kill("SIGKILL"); }, 3000);
   }
-  if (_activeThinkingMsgId) {
+  if (_activeStatus) {
+    _activeStatus.stop();
     try {
-      await ctx.api.editMessageText(ctx.chat.id, _activeThinkingMsgId, "⏹ Задача остановлена.");
+      await ctx.api.editMessageText(ctx.chat.id, _activeStatus.messageId, "⏹ Задача остановлена.");
     } catch {}
-    _activeThinkingMsgId = null;
+    _activeStatus = null;
   }
   console.warn("[/stop] Task stopped by user");
 });
@@ -1766,12 +1892,10 @@ bot.callbackQuery("confirm_continue", async (ctx) => {
   const userId = String(ctx.from.id);
   const sessionId = sessions.get(userId) || null;
 
-  const thinkingMsg = await ctx.reply(nextThinkingPhrase());
-  const typingInterval = setInterval(() => {
-    if (!isGloballyRateLimited()) {
-      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
-    }
-  }, 4000);
+  const thinkingMsg = await ctx.reply(formatThinkingPhrase(0, 0));
+  const status = new StatusMessage(ctx, thinkingMsg.message_id);
+  _activeStatus = status;
+  status.start();
 
   try {
     const result = await callClaude("✔ Продолжай выполнение.", sessionId);
@@ -1779,11 +1903,13 @@ bot.callbackQuery("confirm_continue", async (ctx) => {
       sessions.set(userId, result.sessionId);
       saveSessions();
     }
-    clearInterval(typingInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     await sendResponse(ctx, result.text);
   } catch (err) {
-    clearInterval(typingInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     const friendly = humanizeError(err.message);
     await ctx.reply(friendly || "Ошибка. Попробуй ещё раз.");
@@ -1851,23 +1977,13 @@ bot.on("message:text", async (ctx) => {
 async function handleTextMessage(ctx, text) {
   const userId = String(ctx.from.id);
 
-  const thinkingMsg = await ctx.reply(nextThinkingPhrase());
-  let phraseInterval;
-  const typingInterval = setInterval(() => {
-    if (!isGloballyRateLimited()) {
-      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
-    }
-  }, 4000);
-
-  // Rotate thinking phrases every 3 seconds
-  phraseInterval = setInterval(() => {
-    if (!isGloballyRateLimited()) {
-      ctx.api.editMessageText(ctx.chat.id, thinkingMsg.message_id, nextThinkingPhrase()).catch(() => {});
-    }
-  }, 3000);
+  const thinkingMsg = await ctx.reply(formatThinkingPhrase(0, 0));
+  const status = new StatusMessage(ctx, thinkingMsg.message_id);
+  _activeStatus = status;
+  status.start();
 
   try {
-    // Pre-fetch URLs in message
+    // Pre-fetch URLs in message (including Google Docs/Sheets)
     const urlContext = await prefetchUrls(text);
     const enrichedPrompt = urlContext ? text + urlContext : text;
 
@@ -1893,13 +2009,13 @@ async function handleTextMessage(ctx, text) {
       result.sessionId = contResult.sessionId || result.sessionId;
     }
 
-    clearInterval(typingInterval);
-    clearInterval(phraseInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     await sendResponse(ctx, result.text);
   } catch (err) {
-    clearInterval(typingInterval);
-    clearInterval(phraseInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[error]", err.message);
 
@@ -1930,12 +2046,10 @@ function isResponseTruncated(text) {
 bot.on("message:voice", async (ctx) => {
   if (!isOwner(ctx)) return;
 
-  const thinkingMsg = await ctx.reply("Слушаю голосовое... 🎤");
-  const typingInterval = setInterval(() => {
-    if (!isGloballyRateLimited()) {
-      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
-    }
-  }, 4000);
+  const thinkingMsg = await ctx.reply("Слушаю голосовое… 🎤");
+  const status = new StatusMessage(ctx, thinkingMsg.message_id);
+  _activeStatus = status;
+  status.start();
 
   try {
     const file = await ctx.getFile();
@@ -1947,11 +2061,10 @@ bot.on("message:voice", async (ctx) => {
     try { unlinkSync(tmpPath); } catch {}
 
     if (!transcript) {
-      clearInterval(typingInterval);
+      status.stop();
+      _activeStatus = null;
       await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
 
-      // Если ни Deepgram, ни Whisper не подключены — показываем интерактивное меню.
-      // Иначе расшифровка просто провалилась один раз — обычная ошибка.
       if (!hasAnyTranscriber()) {
         return ctx.reply(VOICE_FALLBACK_PROMPT, {
           parse_mode: "HTML",
@@ -1966,7 +2079,7 @@ bot.on("message:voice", async (ctx) => {
     }
 
     await ctx.api.editMessageText(ctx.chat.id, thinkingMsg.message_id,
-      `Распознано: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"\n\n${nextThinkingPhrase()}`);
+      `Распознано: "${transcript.slice(0, 100)}${transcript.length > 100 ? "..." : ""}"\n\n${formatThinkingPhrase(1, 0)}`);
 
     const userId = String(ctx.from.id);
     const sessionId = sessions.get(userId) || null;
@@ -1977,11 +2090,13 @@ bot.on("message:voice", async (ctx) => {
       saveSessions();
     }
 
-    clearInterval(typingInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     await sendResponse(ctx, result.text);
   } catch (err) {
-    clearInterval(typingInterval);
+    status.stop();
+    _activeStatus = null;
     await ctx.api.deleteMessage(ctx.chat.id, thinkingMsg.message_id).catch(() => {});
     console.error("[voice-error]", err.message);
     const friendly = humanizeError(err.message);
