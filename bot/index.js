@@ -2107,6 +2107,25 @@ bot.on("message:voice", async (ctx) => {
   }
 });
 
+// ─── VS CODE TUNNEL (/connect) ────────────────────────────────────────────────
+// Портировано из agent-factory@3c47c37 (v4.6).
+// Архитектура root-делегата через path-юниты:
+//   бот пишет flag ~/.agent/.tunnel-{start,stop} (без sudo)
+//   → tunnel-{ctl,stop}.path (watcher) триггерит tunnel-{ctl,stop}.service от root
+//   → systemctl start/stop agent-tunnel.service
+// systemd-юниты ставит templates/vscode-tunnel/install-vscode-tunnel.sh.
+
+const TUNNEL_SERVICE = "agent-tunnel";
+const TUNNEL_STATE_DIR = join(AGENT_HOME, ".vscode-tunnel");
+const TUNNEL_TOKEN_FILE = join(TUNNEL_STATE_DIR, "token.json");
+const TUNNEL_LOCK_FILE = join(TUNNEL_STATE_DIR, "tunnel-stable.lock");
+const TUNNEL_START_FLAG = join(DATA_DIR, ".tunnel-start");
+const TUNNEL_STOP_FLAG = join(DATA_DIR, ".tunnel-stop");
+const CODE_BIN = "/usr/local/bin/code";
+
+// chatId → { proc, cancelled } для активного OAuth-флоу (даёт отмену через кнопку)
+const connectProcs = new Map();
+
 // ─── START ────────────────────────────────────────────────────────────────────
 
 bot.catch((err) => {
