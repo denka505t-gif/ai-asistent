@@ -155,7 +155,8 @@ done
 
 if [[ $TUNNEL_DOWNLOAD_OK -eq 1 ]]; then
   chmod +x "$TUNNEL_TEMPLATES_DIR/install-vscode-tunnel.sh"
-  TUNNEL_HEX=$(hostname | md5sum | cut -c1-8)
+  # printf '%s' без newline — иначе md5(hostname + "\n") ≠ node os.hostname()
+  TUNNEL_HEX=$(printf '%s' "$(hostname)" | md5sum | cut -c1-8)
   TUNNEL_NAME="agent-${TUNNEL_HEX}"
   log "Имя туннеля: $TUNNEL_NAME (привязано к этому серверу)"
 

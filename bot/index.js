@@ -18,6 +18,7 @@ import { readFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createHash } from "node:crypto";
+import { hostname } from "node:os";
 import https from "node:https";
 import http from "node:http";
 import { handlePendingInput, registerSecretsHandlers } from "./secrets-menu.js";
@@ -2359,12 +2360,12 @@ async function completeReauthFlow(ctx, text) {
   return true;
 }
 
-// agent-XXXXXXXX — первые 8 hex от md5(OWNER_ID), детерминированно для ученика.
-// Имя туннеля должно быть устойчивым между перезапусками бота, чтобы VS Code
-// видел один и тот же tunnel при ре-подключении.
+// agent-XXXXXXXX — первые 8 hex от md5(hostname).
+// Привязано к серверу, не к ученику — совпадает с тем что setup-server.sh
+// поставил в systemd-юнит (agent-tunnel.service). Бот и установщик считают
+// имя одинаково, без необходимости знать OWNER_ID на этапе установки.
 function vscodeTunnelName() {
-  if (!_ownerId) return "agent-noowner";
-  const hex = createHash("md5").update(String(_ownerId)).digest("hex").slice(0, 8);
+  const hex = createHash("md5").update(hostname()).digest("hex").slice(0, 8);
   return `agent-${hex}`;
 }
 
@@ -2446,10 +2447,9 @@ bot.command("connect", async (ctx) => {
   if (!existsSync(CODE_BIN)) {
     await ctx.reply(
       "⚠️ VS Code CLI не установлен на сервере.\n\n" +
-      "Запусти на сервере под root:\n" +
-      "<code>bash ~/jarvis-architect/templates/vscode-tunnel/install-vscode-tunnel.sh agent-" +
-      (_ownerId ? createHash("md5").update(String(_ownerId)).digest("hex").slice(0, 8) : "xxxxxxxx") +
-      "</code>",
+      "Похоже что setup-server.sh пропустил установку туннеля (нет интернета или GitHub был недоступен).\n\n" +
+      "Перезапусти установку:\n" +
+      "<code>curl -sL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/setup-server.sh | bash</code>",
       { parse_mode: "HTML" }
     );
     return;
