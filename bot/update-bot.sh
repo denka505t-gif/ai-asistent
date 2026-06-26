@@ -40,10 +40,11 @@ BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/bot"
 
 # Files to download
 CORE_FILES="index.js secrets-menu.js voice-helper.js package.json VERSION agent-bot.service"
-LIB_FILES="lib/db.js lib/embeddings.js lib/memory-indexer.js lib/memory-search.js"
+LIB_FILES="lib/db.js lib/embeddings.js lib/memory-indexer.js lib/memory-search.js lib/claude-oauth.js lib/env-write.js"
 SCRIPT_FILES="scripts/manage-schedule.js scripts/memory-search.js scripts/reindex.js"
 MIGRATION_FILES="migrations/001_memory_index.sql"
-ALL_FILES="$CORE_FILES $LIB_FILES $SCRIPT_FILES $MIGRATION_FILES update-bot.sh"
+IMAGES_FILES="images/step5_claude_authorize.png images/step5_browser_error.png"
+ALL_FILES="$CORE_FILES $LIB_FILES $SCRIPT_FILES $MIGRATION_FILES $IMAGES_FILES update-bot.sh"
 
 # Step 1: Download all files to temp directory
 TMP_DIR=$(mktemp -d)
@@ -94,6 +95,10 @@ done
 if [ -d "$BOT_DIR/lib" ]; then
   cp -r "$BOT_DIR/lib" "$BACKUP_DIR/lib"
 fi
+# Backup images/ if exists
+if [ -d "$BOT_DIR/images" ]; then
+  cp -r "$BOT_DIR/images" "$BACKUP_DIR/images"
+fi
 
 # Step 5: Copy new files
 echo "[5/6] Installing update..."
@@ -112,6 +117,53 @@ chmod +x "$BOT_DIR/update-bot.sh"
 echo "  Running npm install..."
 cd "$BOT_DIR"
 npm install --production --no-audit --no-fund 2>&1 | tail -5
+
+# Step 5.5: Install VS Code Tunnel infrastructure (for /connect — v2.1.0+)
+# Идемпотентно: если agent-tunnel.service уже есть — пропускаем.
+# Если нет — скачиваем templates/vscode-tunnel/ + запускаем install-vscode-tunnel.sh.
+# Graceful: при сбое только warn — основной апдейт продолжается.
+echo "[5.5/6] VS Code Tunnel infrastructure..."
+if [ -f /etc/systemd/system/agent-tunnel.service ]; then
+  echo "  agent-tunnel.service уже установлен — пропускаем."
+else
+  echo "  Устанавливаю VS Code Tunnel (для команды /connect)..."
+
+  # Если у ученика был старый 'code tunnel service install' — остановить,
+  # чтобы не было двух туннелей одновременно (старый и новый agent-tunnel)
+  systemctl stop code-tunnel.service 2>/dev/null || true
+  systemctl disable code-tunnel.service 2>/dev/null || true
+
+  TUNNEL_TEMPLATES_DIR="/tmp/jarvis-tunnel-templates"
+  TUNNEL_BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/templates/vscode-tunnel"
+  TUNNEL_FILES="install-vscode-tunnel.sh agent-tunnel.service tunnel-ctl.path tunnel-ctl.service tunnel-stop.path tunnel-stop.service"
+
+  mkdir -p "$TUNNEL_TEMPLATES_DIR"
+  TUNNEL_OK=1
+  for f in $TUNNEL_FILES; do
+    if ! curl -fsSL "$TUNNEL_BASE_URL/$f" -o "$TUNNEL_TEMPLATES_DIR/$f" 2>/dev/null; then
+      echo "  [WARN] не скачал templates/vscode-tunnel/$f"
+      TUNNEL_OK=0
+      break
+    fi
+  done
+
+  if [ $TUNNEL_OK -eq 1 ]; then
+    chmod +x "$TUNNEL_TEMPLATES_DIR/install-vscode-tunnel.sh"
+    # printf '%s' без newline — иначе md5(hostname + "\n") ≠ node os.hostname()
+    TUNNEL_HEX=$(printf '%s' "$(hostname)" | md5sum | cut -c1-8)
+    TUNNEL_NAME="agent-${TUNNEL_HEX}"
+    AGENT_USER=$(stat -c '%U' "$BOT_DIR" 2>/dev/null || echo "agent")
+
+    if bash "$TUNNEL_TEMPLATES_DIR/install-vscode-tunnel.sh" "$TUNNEL_NAME" "$TUNNEL_TEMPLATES_DIR" "$AGENT_USER"; then
+      echo "  VS Code Tunnel установлен: $TUNNEL_NAME"
+      echo "  После рестарта бота — напиши /connect в Telegram для GitHub-авторизации."
+    else
+      echo "  [WARN] установка VS Code Tunnel провалилась (бот всё равно обновится; /connect не заработает)"
+    fi
+  else
+    echo "  [WARN] tunnel-инфраструктура пропущена — основной апдейт продолжается"
+  fi
+fi
 
 # Step 6: Restart bot
 echo "[6/6] Restarting bot..."
