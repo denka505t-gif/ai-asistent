@@ -2376,6 +2376,7 @@ bot.start({
       { command: "reset", description: "Новая сессия" },
       { command: "settings", description: "Настройки" },
       { command: "status", description: "Статус системы" },
+      { command: "connect", description: "🔌 VS Code через туннель" },
     ]);
 
     // Initialize optional modules
