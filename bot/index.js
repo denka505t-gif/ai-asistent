@@ -13,7 +13,7 @@
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { spawn, execFile, execSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync, statSync, createWriteStream } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync, statSync, createWriteStream, appendFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -22,6 +22,17 @@ import https from "node:https";
 import http from "node:http";
 import { handlePendingInput, registerSecretsHandlers } from "./secrets-menu.js";
 import { hasAnyTranscriber, registerVoiceHelpers, voiceFallbackKeyboard, VOICE_FALLBACK_PROMPT } from "./voice-helper.js";
+
+// Claude reauth (v4.7 portированo из agent-factory)
+import {
+  generateCodeVerifier,
+  generateCodeChallenge,
+  generateState,
+  buildAuthUrl,
+  exchangeCodeForToken,
+  OAUTH_SCOPES,
+} from "./lib/claude-oauth.js";
+import { safeEnvWrite, safeEnvRemove } from "./lib/env-write.js";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
