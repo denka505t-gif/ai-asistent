@@ -2137,6 +2137,21 @@ const CODE_BIN = "/usr/local/bin/code";
 // chatId → { proc, cancelled } для активного OAuth-флоу (даёт отмену через кнопку)
 const connectProcs = new Map();
 
+// ─── REAUTH CLAUDE (/reauth) ─────────────────────────────────────────────────
+// Константы для команды /reauth — переподключение Claude через PKCE OAuth.
+// Портировано из agent-factory@03a493a (v4.7).
+
+const ENV_FILE = join(DATA_DIR, ".env");
+const REAUTH_LOG_FILE = join(DATA_DIR, ".reauth.log");
+const REAUTH_NOTIFY_FILE = join(DATA_DIR, ".reauth-pending-notify.json");
+const CREDENTIALS_FILE = join(AGENT_HOME, ".claude", ".credentials.json");
+const STEP5_AUTHORIZE_IMG = join(import.meta.dirname, "images", "step5_claude_authorize.png");
+const STEP5_ERROR_IMG = join(import.meta.dirname, "images", "step5_browser_error.png");
+const REAUTH_TIMEOUT_MS = 10 * 60 * 1000;
+
+// userId → { codeVerifier, state, timer } для активного PKCE-флоу (живёт 10 мин)
+const reauthSessions = new Map();
+
 // agent-XXXXXXXX — первые 8 hex от md5(OWNER_ID), детерминированно для ученика.
 // Имя туннеля должно быть устойчивым между перезапусками бота, чтобы VS Code
 // видел один и тот же tunnel при ре-подключении.
