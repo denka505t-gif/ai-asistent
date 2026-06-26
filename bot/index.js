@@ -2160,6 +2160,175 @@ function appendReauthLog(line) {
   } catch {}
 }
 
+// Шаг 1 reauth: генерим PKCE, шлём 2 скриншота + кнопку «Авторизоваться»
+async function startReauthFlow(ctx) {
+  const userId = String(ctx.from.id);
+  const prev = reauthSessions.get(userId);
+  if (prev) clearTimeout(prev.timer);
+
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+  const stateValue = generateState();
+  const authUrl = buildAuthUrl(codeChallenge, stateValue);
+
+  const timer = setTimeout(() => {
+    if (reauthSessions.has(userId)) {
+      reauthSessions.delete(userId);
+      appendReauthLog(`flow timed out for user ${userId}`);
+      bot.api.sendMessage(
+        ctx.chat.id,
+        "⌛ Время на авторизацию истекло (10 минут). Начни заново через /settings → 🔑 Переподключить Claude"
+      ).catch(() => {});
+    }
+  }, REAUTH_TIMEOUT_MS);
+
+  reauthSessions.set(userId, { codeVerifier, state: stateValue, timer });
+  appendReauthLog(`flow started for user ${userId}`);
+
+  try {
+    if (existsSync(STEP5_AUTHORIZE_IMG)) {
+      await ctx.replyWithPhoto(new InputFile(STEP5_AUTHORIZE_IMG), {
+        caption: "Шаг 1: откроется страница Claude — войди в аккаунт и нажми <b>Authorize</b>",
+        parse_mode: "HTML",
+      });
+    }
+    if (existsSync(STEP5_ERROR_IMG)) {
+      await ctx.replyWithPhoto(new InputFile(STEP5_ERROR_IMG), {
+        caption: "Шаг 2: в браузере появится <b>ошибка</b> — это нормально. Скопируй ВЕСЬ адрес из адресной строки и пришли сюда сообщением.",
+        parse_mode: "HTML",
+      });
+    }
+  } catch (e) {
+    console.warn("[reauth] photo send failed:", e.message);
+  }
+
+  const kb = new InlineKeyboard()
+    .url("🔗 Авторизоваться в Claude", authUrl)
+    .row()
+    .text("✖ Отменить", "reauth_claude:cancel");
+
+  await ctx.reply(
+    "<b>🔑 Переподключение Claude</b>\n\n" +
+      "1) Нажми «Авторизоваться в Claude» ниже\n" +
+      "2) Войди в аккаунт Claude → нажми «Authorize»\n" +
+      "3) В браузере появится ошибка (это норма) — скопируй ВЕСЬ адрес и пришли сюда сообщением\n\n" +
+      "У тебя 10 минут. Передумал — жми «Отменить».",
+    { parse_mode: "HTML", reply_markup: kb, link_preview_options: { is_disabled: true } }
+  );
+}
+
+// Шаг 2 reauth: парсим URL, обмениваем code → token, пишем .env, рестартим бота.
+// Возвращает true если сообщение было обработано как reauth-URL (тогда не передаём в Claude).
+async function completeReauthFlow(ctx, text) {
+  const userId = String(ctx.from.id);
+  const session = reauthSessions.get(userId);
+  if (!session) return false;
+
+  const m = text.match(/[?&]code=([^&\s]+)/);
+  if (!m) {
+    await ctx.reply(
+      "Не вижу <code>code=</code> в сообщении. Пришли ВЕСЬ адрес из адресной строки браузера (он начинается с <code>http://localhost:16424/callback?code=…</code>).",
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  const authCode = decodeURIComponent(m[1]);
+  appendReauthLog(`code received from user ${userId} (${authCode.slice(0, 10)}...)`);
+
+  await ctx.reply("⏳ Обмениваю код на токен (до 30 секунд)...");
+
+  let tokenData;
+  try {
+    tokenData = await exchangeCodeForToken(authCode, session.codeVerifier, session.state);
+  } catch (e) {
+    appendReauthLog(`exchange FAILED for user ${userId}: ${e.message}`);
+    await ctx.reply(
+      `❌ Ошибка обмена: ${e.message}\n\nПопробуй ещё раз через /settings → 🔑 Переподключить Claude — нужен <b>новый</b> URL, старый одноразовый.`,
+      { parse_mode: "HTML" }
+    );
+    clearTimeout(session.timer);
+    reauthSessions.delete(userId);
+    return true;
+  }
+
+  // Бэкап credentials.json (best-effort)
+  try {
+    if (existsSync(CREDENTIALS_FILE)) {
+      const backup = `${CREDENTIALS_FILE}.bak.${Date.now()}`;
+      writeFileSync(backup, readFileSync(CREDENTIALS_FILE), { mode: 0o600 });
+      appendReauthLog(`backup credentials → ${basename(backup)}`);
+    }
+  } catch (e) {
+    console.warn("[reauth] backup failed:", e.message);
+  }
+
+  // Запись refresh+scopes в .env, удаление старого TOKEN
+  try {
+    safeEnvRemove(ENV_FILE, "CLAUDE_CODE_OAUTH_TOKEN");
+    safeEnvWrite(ENV_FILE, "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", tokenData.refresh_token);
+    safeEnvWrite(ENV_FILE, "CLAUDE_CODE_OAUTH_SCOPES", OAUTH_SCOPES);
+    appendReauthLog(`env updated (refresh+scopes), old TOKEN removed`);
+  } catch (e) {
+    appendReauthLog(`env write FAILED: ${e.message}`);
+    await ctx.reply(`❌ Не смог записать в .env: ${e.message}`);
+    clearTimeout(session.timer);
+    reauthSessions.delete(userId);
+    return true;
+  }
+
+  // Регистрация токена в Claude CLI (best-effort — на рестарте auth-check должен дотянуть)
+  await ctx.reply("🔧 Регистрирую токен в Claude CLI...");
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn("claude", ["auth", "login"], {
+        env: {
+          ...process.env,
+          HOME: AGENT_HOME,
+          NODE_OPTIONS: "--dns-result-order=ipv4first",
+          CLAUDE_CODE_OAUTH_REFRESH_TOKEN: tokenData.refresh_token,
+          CLAUDE_CODE_OAUTH_SCOPES: OAUTH_SCOPES,
+        },
+        timeout: 60000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`exit code ${code}: ${stderr.slice(0, 200)}`));
+      });
+      child.on("error", reject);
+    });
+    appendReauthLog(`claude auth login OK`);
+  } catch (e) {
+    appendReauthLog(`claude auth login FAILED: ${e.message}`);
+    await ctx.reply(
+      `⚠️ Токен записан в .env, но <code>claude auth login</code> не отработал: ${e.message}\n\nЯ всё равно перезапущусь — авто-recovery на boot должен дотянуть.`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  clearTimeout(session.timer);
+  reauthSessions.delete(userId);
+
+  // Pending-notify marker: после рестарта пришлю "Готов к работе"
+  try {
+    writeFileSync(
+      REAUTH_NOTIFY_FILE,
+      JSON.stringify({ chatId: ctx.chat.id, ts: Date.now() }),
+      { mode: 0o600 }
+    );
+  } catch (e) {
+    appendReauthLog(`notify-marker write failed: ${e.message}`);
+  }
+
+  await ctx.reply("✅ Готово! Перезагружаюсь — через 10 секунд скажу что готов.");
+  appendReauthLog(`flow completed for user ${userId}, exiting for systemd restart`);
+  setTimeout(() => process.exit(0), 1500);
+  return true;
+}
+
 // agent-XXXXXXXX — первые 8 hex от md5(OWNER_ID), детерминированно для ученика.
 // Имя туннеля должно быть устойчивым между перезапусками бота, чтобы VS Code
 // видел один и тот же tunnel при ре-подключении.
