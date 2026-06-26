@@ -12,17 +12,28 @@
 
 import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
-import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync, statSync } from "node:fs";
+import { spawn, execFile, execSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, renameSync, copyFileSync, statSync, createWriteStream, appendFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { createWriteStream } from "node:fs";
-import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { hostname } from "node:os";
 import https from "node:https";
 import http from "node:http";
 import { handlePendingInput, registerSecretsHandlers } from "./secrets-menu.js";
 import { hasAnyTranscriber, registerVoiceHelpers, voiceFallbackKeyboard, VOICE_FALLBACK_PROMPT } from "./voice-helper.js";
+
+// Claude reauth (v4.7 portированo из agent-factory)
+import {
+  generateCodeVerifier,
+  generateCodeChallenge,
+  generateState,
+  buildAuthUrl,
+  exchangeCodeForToken,
+  OAUTH_SCOPES,
+} from "./lib/claude-oauth.js";
+import { safeEnvWrite, safeEnvRemove } from "./lib/env-write.js";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -1553,6 +1564,7 @@ function settingsKeyboard() {
     .text(`🕐 Часовой пояс: ${state.timezone || "Europe/Moscow"}`, "settings_tz").row()
     .text(`💰 Лимит: $${limit}/день (потрачено: $${spent.toFixed(2)})`, "settings_spend_limit").row()
     .text(`🔄 Перезагрузка`, "settings_restart").row()
+    .text(`🔑 Переподключить Claude`, "settings_reauth_claude").row()
     .text(`✖ Закрыть`, "settings_close");
 }
 
@@ -1654,6 +1666,29 @@ bot.callbackQuery("settings_close", async (ctx) => {
 bot.callbackQuery("settings_back", async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.editMessageText("⚙️ Настройки", { reply_markup: settingsKeyboard() });
+});
+
+bot.callbackQuery("settings_reauth_claude", async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCallbackQuery();
+  await ctx.answerCallbackQuery();
+  try { await ctx.deleteMessage(); } catch {}
+  await startReauthFlow(ctx);
+});
+
+bot.callbackQuery("reauth_claude:cancel", async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCallbackQuery();
+  await ctx.answerCallbackQuery("Отменено");
+  const s = reauthSessions.get(String(ctx.from.id));
+  if (s) {
+    clearTimeout(s.timer);
+    reauthSessions.delete(String(ctx.from.id));
+  }
+  appendReauthLog(`flow cancelled by user ${ctx.from.id}`);
+  try {
+    await ctx.editMessageText("Отменено. Когда захочешь — /settings → 🔑 Переподключить Claude");
+  } catch {
+    await ctx.reply("Отменено. Когда захочешь — /settings → 🔑 Переподключить Claude");
+  }
 });
 
 // Model selection callbacks
@@ -1965,10 +2000,16 @@ bot.on("message:video", async (ctx) => {
 bot.on("message:text", async (ctx) => {
   if (!isOwner(ctx)) return;
 
+  const text = ctx.message.text;
+
+  // Reauth flow: highest priority — юзер вставляет URL с ?code=...
+  if (reauthSessions.has(String(ctx.from.id))) {
+    const handled = await completeReauthFlow(ctx, text);
+    if (handled) return;
+  }
+
   // Если ждём ввод секрета — обработать и не передавать в Claude
   if (await handlePendingInput(ctx)) return;
-
-  const text = ctx.message.text;
 
   // Bootstrap intercept — if wizard is active, handle answers
   if (await handleBootstrap(ctx, text)) return;
@@ -2108,6 +2149,457 @@ bot.on("message:voice", async (ctx) => {
   }
 });
 
+// ─── VS CODE TUNNEL (/connect) ────────────────────────────────────────────────
+// Портировано из agent-factory@3c47c37 (v4.6).
+// Архитектура root-делегата через path-юниты:
+//   бот пишет flag ~/.agent/.tunnel-{start,stop} (без sudo)
+//   → tunnel-{ctl,stop}.path (watcher) триггерит tunnel-{ctl,stop}.service от root
+//   → systemctl start/stop agent-tunnel.service
+// systemd-юниты ставит templates/vscode-tunnel/install-vscode-tunnel.sh.
+
+const TUNNEL_SERVICE = "agent-tunnel";
+const TUNNEL_STATE_DIR = join(AGENT_HOME, ".vscode-tunnel");
+const TUNNEL_TOKEN_FILE = join(TUNNEL_STATE_DIR, "token.json");
+const TUNNEL_LOCK_FILE = join(TUNNEL_STATE_DIR, "tunnel-stable.lock");
+const TUNNEL_START_FLAG = join(DATA_DIR, ".tunnel-start");
+const TUNNEL_STOP_FLAG = join(DATA_DIR, ".tunnel-stop");
+const CODE_BIN = "/usr/local/bin/code";
+
+// chatId → { proc, cancelled } для активного OAuth-флоу (даёт отмену через кнопку)
+const connectProcs = new Map();
+
+// ─── REAUTH CLAUDE (/reauth) ─────────────────────────────────────────────────
+// Константы для команды /reauth — переподключение Claude через PKCE OAuth.
+// Портировано из agent-factory@03a493a (v4.7).
+
+const ENV_FILE = join(DATA_DIR, ".env");
+const REAUTH_LOG_FILE = join(DATA_DIR, ".reauth.log");
+const REAUTH_NOTIFY_FILE = join(DATA_DIR, ".reauth-pending-notify.json");
+const CREDENTIALS_FILE = join(AGENT_HOME, ".claude", ".credentials.json");
+const STEP5_AUTHORIZE_IMG = join(import.meta.dirname, "images", "step5_claude_authorize.png");
+const STEP5_ERROR_IMG = join(import.meta.dirname, "images", "step5_browser_error.png");
+const REAUTH_TIMEOUT_MS = 10 * 60 * 1000;
+
+// userId → { codeVerifier, state, timer } для активного PKCE-флоу (живёт 10 мин)
+const reauthSessions = new Map();
+
+// Лог reauth-событий БЕЗ значений токенов — только факты (started, exchanged, failed)
+function appendReauthLog(line) {
+  try {
+    const ts = new Date().toISOString();
+    appendFileSync(REAUTH_LOG_FILE, `[${ts}] ${line}\n`);
+  } catch {}
+}
+
+// Шаг 1 reauth: генерим PKCE, шлём 2 скриншота + кнопку «Авторизоваться»
+async function startReauthFlow(ctx) {
+  const userId = String(ctx.from.id);
+  const prev = reauthSessions.get(userId);
+  if (prev) clearTimeout(prev.timer);
+
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+  const stateValue = generateState();
+  const authUrl = buildAuthUrl(codeChallenge, stateValue);
+
+  const timer = setTimeout(() => {
+    if (reauthSessions.has(userId)) {
+      reauthSessions.delete(userId);
+      appendReauthLog(`flow timed out for user ${userId}`);
+      bot.api.sendMessage(
+        ctx.chat.id,
+        "⌛ Время на авторизацию истекло (10 минут). Начни заново через /settings → 🔑 Переподключить Claude"
+      ).catch(() => {});
+    }
+  }, REAUTH_TIMEOUT_MS);
+
+  reauthSessions.set(userId, { codeVerifier, state: stateValue, timer });
+  appendReauthLog(`flow started for user ${userId}`);
+
+  try {
+    if (existsSync(STEP5_AUTHORIZE_IMG)) {
+      await ctx.replyWithPhoto(new InputFile(STEP5_AUTHORIZE_IMG), {
+        caption: "Шаг 1: откроется страница Claude — войди в аккаунт и нажми <b>Authorize</b>",
+        parse_mode: "HTML",
+      });
+    }
+    if (existsSync(STEP5_ERROR_IMG)) {
+      await ctx.replyWithPhoto(new InputFile(STEP5_ERROR_IMG), {
+        caption: "Шаг 2: в браузере появится <b>ошибка</b> — это нормально. Скопируй ВЕСЬ адрес из адресной строки и пришли сюда сообщением.",
+        parse_mode: "HTML",
+      });
+    }
+  } catch (e) {
+    console.warn("[reauth] photo send failed:", e.message);
+  }
+
+  const kb = new InlineKeyboard()
+    .url("🔗 Авторизоваться в Claude", authUrl)
+    .row()
+    .text("✖ Отменить", "reauth_claude:cancel");
+
+  await ctx.reply(
+    "<b>🔑 Переподключение Claude</b>\n\n" +
+      "1) Нажми «Авторизоваться в Claude» ниже\n" +
+      "2) Войди в аккаунт Claude → нажми «Authorize»\n" +
+      "3) В браузере появится ошибка (это норма) — скопируй ВЕСЬ адрес и пришли сюда сообщением\n\n" +
+      "У тебя 10 минут. Передумал — жми «Отменить».",
+    { parse_mode: "HTML", reply_markup: kb, link_preview_options: { is_disabled: true } }
+  );
+}
+
+// Шаг 2 reauth: парсим URL, обмениваем code → token, пишем .env, рестартим бота.
+// Возвращает true если сообщение было обработано как reauth-URL (тогда не передаём в Claude).
+async function completeReauthFlow(ctx, text) {
+  const userId = String(ctx.from.id);
+  const session = reauthSessions.get(userId);
+  if (!session) return false;
+
+  const m = text.match(/[?&]code=([^&\s]+)/);
+  if (!m) {
+    await ctx.reply(
+      "Не вижу <code>code=</code> в сообщении. Пришли ВЕСЬ адрес из адресной строки браузера (он начинается с <code>http://localhost:16424/callback?code=…</code>).",
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  const authCode = decodeURIComponent(m[1]);
+  appendReauthLog(`code received from user ${userId} (${authCode.slice(0, 10)}...)`);
+
+  await ctx.reply("⏳ Обмениваю код на токен (до 30 секунд)...");
+
+  let tokenData;
+  try {
+    tokenData = await exchangeCodeForToken(authCode, session.codeVerifier, session.state);
+  } catch (e) {
+    appendReauthLog(`exchange FAILED for user ${userId}: ${e.message}`);
+    await ctx.reply(
+      `❌ Ошибка обмена: ${e.message}\n\nПопробуй ещё раз через /settings → 🔑 Переподключить Claude — нужен <b>новый</b> URL, старый одноразовый.`,
+      { parse_mode: "HTML" }
+    );
+    clearTimeout(session.timer);
+    reauthSessions.delete(userId);
+    return true;
+  }
+
+  // Бэкап credentials.json (best-effort)
+  try {
+    if (existsSync(CREDENTIALS_FILE)) {
+      const backup = `${CREDENTIALS_FILE}.bak.${Date.now()}`;
+      writeFileSync(backup, readFileSync(CREDENTIALS_FILE), { mode: 0o600 });
+      appendReauthLog(`backup credentials → ${basename(backup)}`);
+    }
+  } catch (e) {
+    console.warn("[reauth] backup failed:", e.message);
+  }
+
+  // Запись refresh+scopes в .env, удаление старого TOKEN
+  try {
+    safeEnvRemove(ENV_FILE, "CLAUDE_CODE_OAUTH_TOKEN");
+    safeEnvWrite(ENV_FILE, "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", tokenData.refresh_token);
+    safeEnvWrite(ENV_FILE, "CLAUDE_CODE_OAUTH_SCOPES", OAUTH_SCOPES);
+    appendReauthLog(`env updated (refresh+scopes), old TOKEN removed`);
+  } catch (e) {
+    appendReauthLog(`env write FAILED: ${e.message}`);
+    await ctx.reply(`❌ Не смог записать в .env: ${e.message}`);
+    clearTimeout(session.timer);
+    reauthSessions.delete(userId);
+    return true;
+  }
+
+  // Регистрация токена в Claude CLI (best-effort — на рестарте auth-check должен дотянуть)
+  await ctx.reply("🔧 Регистрирую токен в Claude CLI...");
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn("claude", ["auth", "login"], {
+        env: {
+          ...process.env,
+          HOME: AGENT_HOME,
+          NODE_OPTIONS: "--dns-result-order=ipv4first",
+          CLAUDE_CODE_OAUTH_REFRESH_TOKEN: tokenData.refresh_token,
+          CLAUDE_CODE_OAUTH_SCOPES: OAUTH_SCOPES,
+        },
+        timeout: 60000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`exit code ${code}: ${stderr.slice(0, 200)}`));
+      });
+      child.on("error", reject);
+    });
+    appendReauthLog(`claude auth login OK`);
+  } catch (e) {
+    appendReauthLog(`claude auth login FAILED: ${e.message}`);
+    await ctx.reply(
+      `⚠️ Токен записан в .env, но <code>claude auth login</code> не отработал: ${e.message}\n\nЯ всё равно перезапущусь — авто-recovery на boot должен дотянуть.`,
+      { parse_mode: "HTML" }
+    );
+  }
+
+  clearTimeout(session.timer);
+  reauthSessions.delete(userId);
+
+  // Pending-notify marker: после рестарта пришлю "Готов к работе"
+  try {
+    writeFileSync(
+      REAUTH_NOTIFY_FILE,
+      JSON.stringify({ chatId: ctx.chat.id, ts: Date.now() }),
+      { mode: 0o600 }
+    );
+  } catch (e) {
+    appendReauthLog(`notify-marker write failed: ${e.message}`);
+  }
+
+  await ctx.reply("✅ Готово! Перезагружаюсь — через 10 секунд скажу что готов.");
+  appendReauthLog(`flow completed for user ${userId}, exiting for systemd restart`);
+  setTimeout(() => process.exit(0), 1500);
+  return true;
+}
+
+// agent-XXXXXXXX — первые 8 hex от md5(hostname).
+// Привязано к серверу, не к ученику — совпадает с тем что setup-server.sh
+// поставил в systemd-юнит (agent-tunnel.service). Бот и установщик считают
+// имя одинаково, без необходимости знать OWNER_ID на этапе установки.
+function vscodeTunnelName() {
+  const hex = createHash("md5").update(hostname()).digest("hex").slice(0, 8);
+  return `agent-${hex}`;
+}
+
+// "23 июн., 09:31 UTC (~5ч 12м назад)"
+function formatTunnelTimeAgo(iso) {
+  try {
+    const dt = new Date(iso);
+    const dateStr = dt.toLocaleDateString("ru-RU", { day: "numeric", month: "short", timeZone: "UTC" });
+    const timeStr = dt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
+    const diffMs = Date.now() - dt.getTime();
+    const totalMin = Math.max(0, Math.floor(diffMs / 60000));
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    const ago = h > 0 ? `~${h}ч ${m}м назад` : `~${m}м назад`;
+    return `${dateStr}, ${timeStr} UTC (${ago})`;
+  } catch {
+    return iso;
+  }
+}
+
+// systemctl is-active --quiet через exec (без блокировки event loop)
+function isTunnelServiceActive() {
+  return new Promise((resolve) => {
+    execFile("systemctl", ["is-active", "--quiet", TUNNEL_SERVICE], (err) => resolve(!err));
+  });
+}
+
+bot.command("connect", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const chatId = ctx.chat.id;
+  const tunnelName = vscodeTunnelName();
+
+  // === ПУТЬ A: уже подключён (по state) ===
+  if (state.tunnelReady) {
+    const active = await isTunnelServiceActive();
+    if (active) {
+      if (!existsSync(TUNNEL_TOKEN_FILE)) {
+        // Сервис жив, но GitHub-токен пропал — переподключаем
+        state.tunnelReady = false;
+        state.tunnelConnectedAt = undefined;
+        saveState(state);
+        await ctx.reply("🔄 Туннель работает, но авторизация слетела. Переподключаю...");
+        // fall through к OAuth
+      } else {
+        const since = state.tunnelConnectedAt ? `\nПодключён: ${formatTunnelTimeAgo(state.tunnelConnectedAt)}` : "";
+        const url = `https://vscode.dev/tunnel/${tunnelName}`;
+        const kb = new InlineKeyboard().text("⏹ Отключить", "connect:disconnect");
+        await ctx.reply(
+          `✔ <b>VS Code подключён</b>\n\n` +
+          `Имя туннеля: <code>${tunnelName}</code>${since}\n\n` +
+          `🔗 <a href="${url}">Открыть в браузере</a>\n\n` +
+          `Или в VS Code: Cmd+Shift+P → Remote-Tunnels: Connect to Tunnel → <code>${tunnelName}</code>`,
+          { parse_mode: "HTML", reply_markup: kb, link_preview_options: { is_disabled: true } }
+        );
+        return;
+      }
+    } else {
+      // state говорит ready, но сервис не активен → сбрасываем и переподключаем
+      state.tunnelReady = false;
+      state.tunnelConnectedAt = undefined;
+      saveState(state);
+      await ctx.reply(
+        "🔄 Туннель отключился — нужна повторная авторизация GitHub.\n" +
+        "Это нормально — токен действует ~24 часа.\n\nПереподключаю..."
+      );
+    }
+  }
+
+  // === ПУТЬ B: подключаемся через OAuth ===
+  // Отменяем предыдущий висящий процесс если был
+  const prev = connectProcs.get(chatId);
+  if (prev) {
+    prev.cancelled = true;
+    try { prev.proc.kill(); } catch {}
+    connectProcs.delete(chatId);
+  }
+
+  // Проверка что бинарь code установлен
+  if (!existsSync(CODE_BIN)) {
+    await ctx.reply(
+      "⚠️ VS Code CLI не установлен на сервере.\n\n" +
+      "Похоже что setup-server.sh пропустил установку туннеля (нет интернета или GitHub был недоступен).\n\n" +
+      "Перезапусти установку:\n" +
+      "<code>curl -sL https://raw.githubusercontent.com/Ntmib/jarvis-architect/main/setup-server.sh | bash</code>",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  await ctx.reply("🔌 Запускаю VS Code подключение...");
+
+  // IIFE чтобы команда вернулась сразу, OAuth идёт в фоне
+  (async () => {
+    let stepMsgId;
+    try {
+      // Pre-cleanup: если сервис активен но токена нет — корректно остановить
+      try {
+        const wasActive = await isTunnelServiceActive();
+        if (wasActive && !existsSync(TUNNEL_TOKEN_FILE)) {
+          writeFileSync(TUNNEL_STOP_FLAG, "");
+          for (let i = 0; i < 6; i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            if (!(await isTunnelServiceActive())) break;
+          }
+        }
+        try { unlinkSync(TUNNEL_START_FLAG); } catch {}
+        try { unlinkSync(TUNNEL_LOCK_FILE); } catch {}
+      } catch {}
+
+      // === OAUTH: spawn code tunnel user login --provider github ===
+      const deviceCode = await new Promise((resolve, reject) => {
+        const proc = spawn(CODE_BIN, ["tunnel", "user", "login", "--provider", "github"], {
+          env: {
+            ...process.env,
+            HOME: AGENT_HOME,
+            VSCODE_CLI_DATA_DIR: TUNNEL_STATE_DIR,
+          },
+        });
+        let buf = "";
+        const onData = (chunk) => {
+          buf += chunk.toString();
+          const urlMatch = buf.match(/https:\/\/github\.com\/login\/device/);
+          const codeMatch = buf.match(/code[:\s]+([A-Z0-9]{4}-[A-Z0-9]{4})/i);
+          if (urlMatch && codeMatch) {
+            resolve({ url: "https://github.com/login/device", code: codeMatch[1], proc });
+          }
+        };
+        proc.stdout?.on("data", onData);
+        proc.stderr?.on("data", onData);
+        proc.on("error", reject);
+        setTimeout(() => reject(new Error("Timeout: device code не получен за 30 сек")), 30000);
+      });
+
+      const entry = { proc: deviceCode.proc, cancelled: false };
+      connectProcs.set(chatId, entry);
+
+      const kbCancel = new InlineKeyboard().text("🚫 Отменить", `connect:cancel:${chatId}`);
+      const stepMsg = await bot.api.sendMessage(
+        chatId,
+        `📱 <b>Шаг 1 из 2 — GitHub авторизация</b>\n\n` +
+        `1. Открой в браузере: <a href="${deviceCode.url}">${deviceCode.url}</a>\n` +
+        `2. Введи код: <code>${deviceCode.code}</code>\n\n` +
+        `⏳ Жду подтверждения (до 2 минут)...`,
+        { parse_mode: "HTML", reply_markup: kbCancel, link_preview_options: { is_disabled: true } }
+      );
+      stepMsgId = stepMsg.message_id;
+
+      // Ждём exit 0 = юзер успешно авторизовался
+      await new Promise((resolve, reject) => {
+        deviceCode.proc.on("close", (code) => {
+          if (entry.cancelled) reject(new Error("cancelled"));
+          else if (code === 0) resolve();
+          else reject(new Error(`code tunnel exited with code ${code}`));
+        });
+        setTimeout(() => {
+          try { deviceCode.proc.kill(); } catch {}
+          reject(new Error("Timeout: авторизация не выполнена за 2 минуты"));
+        }, 120000);
+      });
+
+      connectProcs.delete(chatId);
+      if (stepMsgId) try { await bot.api.deleteMessage(chatId, stepMsgId); } catch {}
+
+      // === ЗАПУСК сервиса через path-юнит ===
+      writeFileSync(TUNNEL_START_FLAG, "");
+      await new Promise((r) => setTimeout(r, 6000));
+
+      if (!(await isTunnelServiceActive())) {
+        throw new Error("agent-tunnel.service не запустился. Попробуй /connect ещё раз.");
+      }
+
+      // === УСПЕХ ===
+      const nowIso = new Date().toISOString();
+      state.tunnelReady = true;
+      state.tunnelConnectedAt = nowIso;
+      saveState(state);
+
+      const url = `https://vscode.dev/tunnel/${tunnelName}`;
+      const kbDisconnect = new InlineKeyboard().text("⏹ Отключить", "connect:disconnect");
+      await bot.api.sendMessage(
+        chatId,
+        `✔ <b>VS Code подключение готово!</b>\n\n` +
+        `Имя туннеля: <code>${tunnelName}</code>\n` +
+        `Подключён: ${formatTunnelTimeAgo(nowIso)}\n\n` +
+        `🔗 <a href="${url}">Открыть в браузере</a>\n\n` +
+        `Или в VS Code на компьютере:\n` +
+        `Cmd+Shift+P → "Remote-Tunnels: Connect to Tunnel" → <code>${tunnelName}</code>`,
+        { parse_mode: "HTML", reply_markup: kbDisconnect, link_preview_options: { is_disabled: true } }
+      );
+    } catch (err) {
+      connectProcs.delete(chatId);
+      if (err.message === "cancelled") return;
+      if (stepMsgId) try { await bot.api.deleteMessage(chatId, stepMsgId); } catch {}
+      await bot.api.sendMessage(chatId, `❌ Ошибка: ${err.message}\n\nПопробуй снова /connect`);
+    }
+  })();
+});
+
+// /reauth — запуск flow переподключения Claude.
+// Регистрируется ДО bot.on("message:text") иначе message:text перехватит
+// сообщение первым и оборвёт цепочку (классическая Grammy-ловушка).
+bot.command("reauth", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await startReauthFlow(ctx);
+});
+
+bot.callbackQuery(/^connect:cancel:(\d+)$/, async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCallbackQuery("⛔");
+  const chatId = parseInt(ctx.match[1]);
+  const entry = connectProcs.get(chatId);
+  if (entry) {
+    entry.cancelled = true;
+    try { entry.proc.kill(); } catch {}
+    connectProcs.delete(chatId);
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("🚫 Подключение отменено.");
+});
+
+bot.callbackQuery("connect:disconnect", async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCallbackQuery("⛔");
+  await ctx.answerCallbackQuery();
+  try {
+    writeFileSync(TUNNEL_STOP_FLAG, "");
+    state.tunnelReady = false;
+    state.tunnelConnectedAt = undefined;
+    saveState(state);
+    await new Promise((r) => setTimeout(r, 2000));
+    await ctx.editMessageText("⏹ VS Code туннель отключён.\n\nДля повторного подключения: /connect");
+  } catch (err) {
+    await ctx.editMessageText(`❌ Ошибка при отключении: ${err.message}`);
+  }
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 
 bot.catch((err) => {
@@ -2125,11 +2617,35 @@ bot.start({
       { command: "reset", description: "Новая сессия" },
       { command: "settings", description: "Настройки" },
       { command: "status", description: "Статус системы" },
+      { command: "connect", description: "🔌 VS Code через туннель" },
+      { command: "reauth", description: "🔑 Переподключить Claude" },
     ]);
 
     // Initialize optional modules
     await initSemanticMemory();
     startScheduler();
+
+    // Reauth notify: если только что прошёл reauth-flow — сообщить юзеру что готов.
+    // Маркер пишется в completeReauthFlow перед process.exit(0); systemd рестартит.
+    try {
+      if (existsSync(REAUTH_NOTIFY_FILE)) {
+        const data = JSON.parse(readFileSync(REAUTH_NOTIFY_FILE, "utf8"));
+        const age = Date.now() - (data.ts || 0);
+        if (age < 5 * 60 * 1000 && data.chatId) {
+          await bot.api.sendMessage(
+            data.chatId,
+            "✅ Готов к работе! Можешь писать обычным сообщением."
+          );
+          appendReauthLog(`notify sent to chat ${data.chatId} (age ${age}ms)`);
+        } else {
+          appendReauthLog(`notify-marker stale (age ${age}ms) — discarded`);
+        }
+        unlinkSync(REAUTH_NOTIFY_FILE);
+      }
+    } catch (e) {
+      console.warn("[reauth-notify] error:", e.message);
+      try { unlinkSync(REAUTH_NOTIFY_FILE); } catch {}
+    }
 
     console.log(`Agent bot v${BOT_VERSION} started (workspace: ${WORKSPACE}, projects: ${PROJECTS})`);
     console.log(`Model: ${getCurrentModel()}, Bootstrap: ${state.bootstrapDone ? "done" : "pending"}`);
