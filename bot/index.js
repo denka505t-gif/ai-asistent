@@ -2152,6 +2152,14 @@ const REAUTH_TIMEOUT_MS = 10 * 60 * 1000;
 // userId → { codeVerifier, state, timer } для активного PKCE-флоу (живёт 10 мин)
 const reauthSessions = new Map();
 
+// Лог reauth-событий БЕЗ значений токенов — только факты (started, exchanged, failed)
+function appendReauthLog(line) {
+  try {
+    const ts = new Date().toISOString();
+    appendFileSync(REAUTH_LOG_FILE, `[${ts}] ${line}\n`);
+  } catch {}
+}
+
 // agent-XXXXXXXX — первые 8 hex от md5(OWNER_ID), детерминированно для ученика.
 // Имя туннеля должно быть устойчивым между перезапусками бота, чтобы VS Code
 // видел один и тот же tunnel при ре-подключении.
