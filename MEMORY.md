@@ -57,6 +57,15 @@
 
 ---
 
+## Установленные скиллы и плагины
+
+Дата установки: **2026-07-07**
+
+Плагины: superpowers 6.1.1, frontend-design.
+Скиллы в `.claude/skills/`: content-creator, discovery-interview, frontend-design, fullstack-developer, reminder, server-setup + 14 скиллов superpowers (brainstorming, dispatching-parallel-agents, executing-plans, finishing-a-development-branch, receiving-code-review, requesting-code-review, subagent-driven-development, systematic-debugging, test-driven-development, using-git-worktrees, using-superpowers, verification-before-completion, writing-plans, writing-skills).
+
+---
+
 ## Ключевые решения
 
 > Решения, которые приняты один раз и не обсуждаются повторно. Например: «работаем только по предоплате», «программу лояльности не делаем в этом квартале», «фронтенд только на React». Чтобы каждую неделю не возвращаться к одному и тому же.

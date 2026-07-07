@@ -230,6 +230,43 @@
 
 ---
 
+## Моя команда — скиллы и плагины
+
+### Плагины (глобальные)
+
+| Плагин | Версия |
+|---|---|
+| superpowers | 6.1.1 |
+| frontend-design | latest |
+
+### Скиллы в проекте (`.claude/skills/`)
+
+**Базовые:**
+- `content-creator` — создание контента для блогов и соцсетей
+- `discovery-interview` — интервью для превращения идеи в ТЗ
+- `frontend-design` — дизайн интерфейсов (обновлён 2026-07-07)
+- `fullstack-developer` — fullstack-разработка (React, Node.js, БД)
+- `reminder` — напоминания и регулярные задачи
+- `server-setup` — установка Агента на VPS
+
+**Superpowers (14):**
+- `brainstorming` — мозговой штурм перед любой творческой задачей
+- `dispatching-parallel-agents` — параллельный запуск агентов
+- `executing-plans` — выполнение написанного плана
+- `finishing-a-development-branch` — завершение ветки разработки
+- `receiving-code-review` — получение и разбор ревью
+- `requesting-code-review` — запрос ревью кода
+- `subagent-driven-development` — разработка через субагентов
+- `systematic-debugging` — системная отладка ошибок
+- `test-driven-development` — TDD-подход к разработке
+- `using-git-worktrees` — изолированные рабочие деревья git
+- `using-superpowers` — как пользоваться superpowers
+- `verification-before-completion` — проверка перед завершением задачи
+- `writing-plans` — написание планов реализации
+- `writing-skills` — создание новых скиллов
+
+---
+
 ## Что НЕ удалять без явной просьбы
 
 - `SOUL.md`
