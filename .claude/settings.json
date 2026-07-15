@@ -49,7 +49,8 @@
     "defaultMode": "bypassPermissions",
     "additionalDirectories": [
       "/tmp",
-      "/home/agent/projects"
+      "/home/agent/projects",
+      "C:\\Users\\dell\\Documents\\projects"
     ]
   },
   "effortLevel": "xhigh",
