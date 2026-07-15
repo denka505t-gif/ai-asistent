@@ -1,5 +1,11 @@
 # Проекты
 
+## Fishing Assistant — в бою
+
+- Telegram-бот помощника рыболова: `@Fish_Assist_Rus_bot` (сценарии 1–3 работают, сценарий 4 «фото→вид» заморожен)
+- Статус: production на VPS. Источник истины — `~/projects/fishing-assistant/CLAUDE.md` на сервере
+- Локальная копия: `c:\Users\dell\Documents\projects\fishing-assistant\` (может отставать, синхронизации нет)
+
 ## 1. Сопоставление плана и факта строительных работ
 
 - Стек: (определится в процессе)
