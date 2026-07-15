@@ -6,16 +6,22 @@
 
 ---
 
-## Что уже установлено
+## Что уже установлено (актуально на 2026-07-15)
 
-4 скилла идут в комплекте с шаблоном и готовы к работе сразу:
-
+**Базовые скиллы:**
 - `discovery-interview/` — сбор ТЗ через интервью
 - `content-creator/` — написание контента
 - `fullstack-developer/` — разработка кода
-- `frontend-design/` — дизайн интерфейсов
+- `frontend-design/` — дизайн интерфейсов (обновлён 2026-07-07)
+- `reminder/` — напоминания и регулярные задачи
+- `server-setup/` — установка Агента на VPS
+- `jarvis-architect-info/` — справка о шаблоне и сценарии установки
 
-Ниже — описание каждого и инструкции для обновления до последней версии от автора.
+**Копии superpowers-скиллов (14):** brainstorming, dispatching-parallel-agents, executing-plans, finishing-a-development-branch, receiving-code-review, requesting-code-review, subagent-driven-development, systematic-debugging, test-driven-development, using-git-worktrees, using-superpowers, verification-before-completion, writing-plans, writing-skills.
+
+> На ноутбуке эти копии отключены через `settings.local.json` — работает глобальный плагин superpowers. На сервере плагин не работает, там трудятся именно копии. **Файлы не удалять.**
+
+Ниже — описание базовых скиллов и инструкции для обновления до последней версии от автора.
 
 ---
 
@@ -157,18 +163,10 @@ npx degit Ntmib/jarvis-architect/.claude/skills .claude/skills
 ## Текущая структура
 
 ```
-jarvis/
-└── .claude/
-    └── skills/
-        ├── README.md                ← этот файл
-        ├── discovery-interview/
-        │   └── SKILL.md
-        ├── content-creator/
-        │   └── SKILL.md
-        ├── fullstack-developer/
-        │   └── SKILL.md
-        └── frontend-design/
-            └── SKILL.md
+.claude/skills/
+├── README.md                ← этот файл
+├── <базовые скиллы>/        ← 7 папок, список выше
+└── <superpowers-копии>/     ← 14 папок, список выше
 ```
 
-Плагин Superpowers — отдельно, в `~/.claude/plugins/superpowers/` (глобально, во всех проектах).
+Каждая папка содержит SKILL.md. Плагин Superpowers — отдельно, в `~/.claude/plugins/` (глобально, во всех проектах).
