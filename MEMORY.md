@@ -23,7 +23,7 @@
 1. **Сопоставление плана и факта выполненных строительных работ** — анализ выполнения за период
 2. **Технологические карты** — составление карт на выполнение дорожно-строительных работ
 3. **Агент для планирования путешествий** — личный помощник по планированию поездок
-4. **Fishing Assistant** — Telegram-бот помощника рыболова. Папка: `c:\Users\dell\Documents\projects\fishing-assistant\`. Статус: код готов, нужны API-ключи (Telegram BotFather, Anthropic, OpenWeatherMap). ТЗ: `knowledge/specs/2026-07-07-fishing-assistant.md`
+4. **Fishing Assistant** — Telegram-бот помощника рыболова, **в бою**: `@Fish_Assist_Rus_bot` (сценарии 1–3 работают, сценарий 4 «фото→вид» заморожен). Источник истины по статусу — `~/projects/fishing-assistant/CLAUDE.md` на сервере. Локальная копия `c:\Users\dell\Documents\projects\fishing-assistant\` может отставать — синхронизации нет
 5. **Транскрибатор аудиофайлов** — расшифровка → протоколы совещаний (идея)
 6. **Поиск лотов на банкротных торгах** — авто и земля (идея)
 7. **Динамический алкометр** — расчёт BAC во времени (идея)
@@ -45,9 +45,9 @@
 
 ## Стек и инструменты
 
-> Дописывайте по мере выбора: что используете для frontend, backend, AI, deploy, дизайна. Локальные утилиты на компьютере (например yt-dlp, ffmpeg) — тоже сюда.
-
-*Пока пусто. Появится по мере появления конкретного стека.*
+- **Сервер:** Node.js 20, Grammy (Telegram-боты), Claude Code CLI, systemd-сервисы
+- **Ноутбук:** VS Code + Remote-SSH, Git Bash, PuTTY/plink (SSH из скриптов), winget
+- **AI:** Claude по подписке Pro (OAuth, denka505t@gmail.com) — на ноутбуке и на сервере
 
 ---
 
@@ -68,26 +68,24 @@
 
 ## Установленные скиллы и плагины
 
-Дата установки: **2026-07-07**
-
-Плагины: superpowers 6.1.1, frontend-design.
-Скиллы в `.claude/skills/`: content-creator, discovery-interview, frontend-design, fullstack-developer, reminder, server-setup + 14 скиллов superpowers (brainstorming, dispatching-parallel-agents, executing-plans, finishing-a-development-branch, receiving-code-review, requesting-code-review, subagent-driven-development, systematic-debugging, test-driven-development, using-git-worktrees, using-superpowers, verification-before-completion, writing-plans, writing-skills).
+Плагины (глобально, работают): superpowers 6.1.1, frontend-design. Скиллы — актуальный список в `.claude/skills/README.md`. Копии superpowers-скиллов в `.claude/skills/` отключены локально через settings.local.json как дубли живого плагина (2026-07-15). **Файлы копий не удалять** — они нужны серверу, где плагин не работает и трудятся именно копии.
 
 ---
 
 ## Ключевые решения
 
-> Решения, которые приняты один раз и не обсуждаются повторно. Например: «работаем только по предоплате», «программу лояльности не делаем в этом квартале», «фронтенд только на React». Чтобы каждую неделю не возвращаться к одному и тому же.
-
-*Пока пусто. Появится по мере работы.*
+- **Статус проекта живёт только в CLAUDE.md проекта.** В MEMORY.md/PROJECTS.md — одна строка со ссылкой. Синхронизировано с серверным Агентом (2026-07-15)
+- **Код и DNA-файлы между ноутбуком и сервером не синхронизируются автоматически.** Перенос — только через git или вручную, в обе стороны
+- **Fishing Assistant, сценарий 4 (фото→вид)** заморожен решением Дениса — не поднимать без явного запроса
+- **VPS — только с IP вне России**, VPN на сервере не поднимаем (см. «Инфраструктура»)
 
 ---
 
 ## Ссылки на knowledge/
 
-> Карта справочников из папки `knowledge/`. Когда добавите туда новый файл — дайте здесь ссылку и одну строку «когда читать».
-
-*Пока пусто.*
+- `knowledge/claude-reauth-manual.md` — бот отвечает пустыми сообщениями / Claude CLI молчит → переавторизация. Читать при сбоях бота
+- `knowledge/update-guide.md` — как обновить Telegram-бота до новой версии
+- `knowledge/specs/2026-07-07-fishing-assistant.md` — исходное ТЗ Fishing Assistant
 
 ---
 
