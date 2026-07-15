@@ -39,7 +39,7 @@
 - **VPS для агента (развёрнут 2026-07-08):** Beget, сервер "Tranquil Azamat", IP 31.129.109.129, Ubuntu 24.04, 1 ядро/2 ГБ RAM/15 ГБ NVMe. Root-доступ по SSH (пароль у Дениса, в файлы не сохраняем).
 - **Что установлено на сервере:** Node.js 20, Claude Code CLI (авторизован под denka505t@gmail.com, подписка Pro), VS Code CLI + VS Code Tunnel (постоянный systemd-сервис, привязан к GitHub-аккаунту Дениса). Файлы Агента (все 9 DNA-файлов, memory/, knowledge/, .claude/settings.json+skills/) лежат в `/home/agent/workspace/`, симлинк `/home/agent/CLAUDE.md` → `workspace/CLAUDE.md`.
 - **Telegram-бот на сервере:** установлен в `/home/agent/.agent/bot/`, токен в `/home/agent/.agent/.env`, запущен как systemd-сервис `agent-bot` (автозапуск включён). Бот ждёт первый `/start` для авто-привязки к владельцу.
-- **Подключение к серверу с компьютера Дениса:** VS Code → Remote Explorer → Tunnels → сервер, папка `/home/agent/workspace/`.
+- **Подключение к серверу с компьютера Дениса (с 2026-07-15 — Remote-SSH):** VS Code → F1 → «Remote-SSH: Connect to Host» → `agent-server` → папка `/home/agent/workspace/`. Вход по ключу `~/.ssh/id_ed25519` (denis-laptop), прописан в `/root/.ssh/authorized_keys`. Туннель (Tunnels → agent) на ноутбуке сломан из-за побитой установки VS Code — до переустановки не использовать. Детали: `memory/2026-07-15.md`.
 
 ---
 
