@@ -54,6 +54,12 @@
     ]
   },
   "effortLevel": "xhigh",
+  "autoMode": {
+  "allow": [
+    "$defaults",
+    "Bash(ssh agent-server *)"
+  ]
+},
   "skipDangerousModePermissionPrompt": true,
   "enabledPlugins": {
     "superpowers@claude-plugins-official": true
